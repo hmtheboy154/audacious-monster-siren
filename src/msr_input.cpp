@@ -132,8 +132,12 @@ public:
                     if (lyrics && lyrics[0])
                         tuple.set_str(Tuple::Lyrics, lyrics);
                 }
+                if (!tuple.get_str(Tuple::Lyrics))
+                    tuple.set_str(Tuple::Lyrics, String("[No lyrics provided by Monster Siren]"));
             }
 
+            tuple.set_int(Tuple::StartTime, 0);
+            tuple.set_str(Tuple::AudioFile, filename);
             return true;
         }
 
@@ -167,7 +171,11 @@ public:
                 if (lyrics && lyrics[0])
                     tuple.set_str(Tuple::Lyrics, lyrics);
             }
+            if (!tuple.get_str(Tuple::Lyrics))
+                tuple.set_str(Tuple::Lyrics, String("[No lyrics provided by Monster Siren]"));
 
+            tuple.set_int(Tuple::StartTime, 0);
+            tuple.set_str(Tuple::AudioFile, filename);
             return true;
         }
 
@@ -236,6 +244,9 @@ public:
                     t.set_int(Tuple::Bitrate, stream_tuple.get_int(Tuple::Bitrate));
             }
         }
+
+        t.set_int(Tuple::StartTime, 0);
+        t.set_str(Tuple::AudioFile, filename);
 
         if (t.valid())
             set_playback_tuple(std::move(t));
