@@ -123,10 +123,15 @@ public:
                 *image = msr_fetch_image(album.coverUrl);
 
             // Probe exact duration so track shows correct duration and allows seeking right when added
-            if (tuple.get_int(Tuple::Length) <= 0) {
+            if (tuple.get_int(Tuple::Length) <= 0 || !tuple.get_str(Tuple::Lyrics)) {
                 MsrSongDetail song = msr_fetch_song_detail(track.cid);
-                if (song.sourceUrl && song.sourceUrl[0])
+                if (song.sourceUrl && song.sourceUrl[0] && tuple.get_int(Tuple::Length) <= 0)
                     probe_remote_length(song.sourceUrl, tuple);
+                if (song.lyricUrl && song.lyricUrl[0] && !tuple.get_str(Tuple::Lyrics)) {
+                    String lyrics = msr_fetch_lyrics(song.lyricUrl);
+                    if (lyrics && lyrics[0])
+                        tuple.set_str(Tuple::Lyrics, lyrics);
+                }
             }
 
             return true;
@@ -156,6 +161,12 @@ public:
 
             if (song.sourceUrl && song.sourceUrl[0] && tuple.get_int(Tuple::Length) <= 0)
                 probe_remote_length(song.sourceUrl, tuple);
+
+            if (song.lyricUrl && song.lyricUrl[0] && !tuple.get_str(Tuple::Lyrics)) {
+                String lyrics = msr_fetch_lyrics(song.lyricUrl);
+                if (lyrics && lyrics[0])
+                    tuple.set_str(Tuple::Lyrics, lyrics);
+            }
 
             return true;
         }

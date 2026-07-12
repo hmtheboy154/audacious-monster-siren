@@ -33,6 +33,7 @@ static bool g_albums_cached = false;
 static std::map<std::string, MsrAlbum> g_cached_album_details;
 static std::map<std::string, MsrSongDetail> g_cached_song_details;
 static std::map<std::string, Index<char>> g_cached_images;
+static std::map<std::string, String> g_cached_lyrics;
 
 /**
  * Executes a GET request over QNetworkAccessManager and returns raw response bytes.
@@ -322,6 +323,31 @@ Index<char> msr_fetch_image(const String & url)
     return result;
 }
 
+String msr_fetch_lyrics(const String & url)
+{
+    if (!url || !url[0])
+        return String();
+
+    std::string key((const char *)url);
+    {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        auto it = g_cached_lyrics.find(key);
+        if (it != g_cached_lyrics.end())
+            return it->second;
+    }
+
+    QByteArray bytes = msr_fetch_bytes(QString::fromUtf8((const char *)url));
+    if (bytes.isEmpty())
+        return String();
+
+    String result(bytes.constData());
+    {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        g_cached_lyrics[key] = result;
+    }
+    return result;
+}
+
 void msr_cache_clear()
 {
     std::lock_guard<std::mutex> lock(g_cache_mutex);
@@ -330,4 +356,5 @@ void msr_cache_clear()
     g_cached_album_details.clear();
     g_cached_song_details.clear();
     g_cached_images.clear();
+    g_cached_lyrics.clear();
 }

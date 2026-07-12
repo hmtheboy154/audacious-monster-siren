@@ -59,6 +59,7 @@ std::vector<MsrAlbum> msr_fetch_albums();
 MsrAlbum msr_fetch_album_detail(const String & cid);
 MsrSongDetail msr_fetch_song_detail(const String & cid);
 Index<char> msr_fetch_image(const String & url);
+String msr_fetch_lyrics(const String & url);
 
 // Clear memory cache if needed
 void msr_cache_clear();
