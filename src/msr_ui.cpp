@@ -93,24 +93,31 @@ public:
     explicit CatalogFilterProxyModel(QObject * parent = nullptr)
         : QSortFilterProxyModel(parent)
     {
-        setFilterCaseSensitivity(Qt::CaseInsensitive);
+    }
+
+    void setFilterString(const QString & text)
+    {
+        m_filter_text = text.trimmed();
+        invalidateFilter();
     }
 
 protected:
     bool filterAcceptsRow(int source_row, const QModelIndex & source_parent) const override
     {
+        if (m_filter_text.isEmpty())
+            return true;
+
         QModelIndex idx0 = sourceModel()->index(source_row, 0, source_parent);
         QModelIndex idx1 = sourceModel()->index(source_row, 1, source_parent);
-
-        QString query = filterRegularExpression().pattern();
-        if (query.isEmpty())
-            return true;
 
         QString t0 = sourceModel()->data(idx0, Qt::DisplayRole).toString();
         QString t1 = sourceModel()->data(idx1, Qt::DisplayRole).toString();
 
-        return t0.contains(query, Qt::CaseInsensitive) || t1.contains(query, Qt::CaseInsensitive);
+        return t0.contains(m_filter_text, Qt::CaseInsensitive) || t1.contains(m_filter_text, Qt::CaseInsensitive);
     }
+
+private:
+    QString m_filter_text;
 };
 
 class MonsterSirenCatalogWidget : public QWidget
@@ -162,7 +169,7 @@ public:
         layout->addWidget(m_status_label, 0);
 
         connect(m_search_entry, &QLineEdit::textChanged, this, [this](const QString & text) {
-            m_proxy->setFilterRegularExpression(QRegularExpression::escape(text));
+            m_proxy->setFilterString(text);
         });
 
         connect(m_refresh_btn, &QPushButton::clicked, this, [this]() {
