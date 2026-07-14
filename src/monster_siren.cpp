@@ -19,10 +19,18 @@
 #include <QJsonArray>
 #include <QUrl>
 #include <QThread>
+#include <QFile>
+#include <QDir>
+#include <QCryptographicHash>
 #include <mutex>
 #include <map>
 #include <cstring>
 #include <cstdlib>
+
+#include <libaudcore/runtime.h>
+#include <libaudcore/audstrings.h>
+#include <libaudcore/plugin.h>
+#include <QStandardPaths>
 
 #include "monster_siren.h"
 
@@ -158,18 +166,238 @@ MsrUrlParsed msr_parse_url(const char * url)
     return result;
 }
 
-std::vector<MsrAlbum> msr_fetch_albums()
+String msr_get_cache_dir()
 {
+    String dir = aud_get_str("monster-siren", "cache_dir");
+    if (!dir || !dir[0]) {
+        QString qcache = QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation);
+        if (qcache.isEmpty())
+            qcache = QDir::homePath() + "/.cache";
+        QString qpath = QDir(qcache).filePath("audacious/monster-siren");
+        StringBuf def = str_copy(qpath.toUtf8().constData());
+        aud_set_str("monster-siren", "cache_dir", def);
+        dir = String(def);
+    } else {
+        QString qstr = QString::fromUtf8((const char *)dir);
+        if (qstr.startsWith("file://")) {
+            qstr = QUrl(qstr).toLocalFile();
+            if (qstr.isEmpty())
+                qstr = QString::fromUtf8((const char *)dir).mid(7);
+            StringBuf cleaned = str_copy(qstr.toUtf8().constData());
+            aud_set_str("monster-siren", "cache_dir", cleaned);
+            dir = String(cleaned);
+        }
+    }
+    return dir;
+}
+
+static QString msr_url_to_hash(const char * s)
+{
+    if (!s) return QString();
+    return QString::fromLatin1(QCryptographicHash::hash(QByteArray(s), QCryptographicHash::Md5).toHex());
+}
+
+bool msr_load_catalog_from_cache(std::vector<MsrAlbum> & out_albums)
+{
+    if (!aud_get_bool("monster-siren", "enable_cache") || !aud_get_bool("monster-siren", "cache_catalog"))
+        return false;
+
+    String cache_dir = msr_get_cache_dir();
+    StringBuf filepath = filename_build({cache_dir, "catalog.json"});
+    QFile file((const char *)filepath);
+    if (!file.open(QIODevice::ReadOnly))
+        return false;
+
+    QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+    if (!doc.isObject())
+        return false;
+
+    QJsonArray list = doc.object().value("data").toArray();
+    if (list.isEmpty())
+        return false;
+
+    std::vector<MsrAlbum> albums;
+    for (const QJsonValue & val : list) {
+        QJsonObject obj = val.toObject();
+        MsrAlbum album;
+        album.cid = String(obj.value("cid").toString().toUtf8().constData());
+        album.name = String(obj.value("name").toString().toUtf8().constData());
+        album.coverUrl = String(obj.value("coverUrl").toString().toUtf8().constData());
+        album.artistes = String(obj.value("artistes").toString().toUtf8().constData());
+        albums.push_back(std::move(album));
+    }
+    out_albums = std::move(albums);
+    return true;
+}
+
+void msr_save_catalog_to_cache(const std::vector<MsrAlbum> & albums)
+{
+    if (!aud_get_bool("monster-siren", "enable_cache") || !aud_get_bool("monster-siren", "cache_catalog") || albums.empty())
+        return;
+
+    String cache_dir = msr_get_cache_dir();
+    QDir().mkpath(QString::fromUtf8((const char *)cache_dir));
+
+    StringBuf filepath = filename_build({cache_dir, "catalog.json"});
+    QJsonArray arr;
+    for (const auto & alb : albums) {
+        QJsonObject obj;
+        obj["cid"] = (const char *)alb.cid;
+        obj["name"] = (const char *)alb.name;
+        obj["coverUrl"] = (const char *)alb.coverUrl;
+        obj["artistes"] = (const char *)alb.artistes;
+        arr.append(obj);
+    }
+    QJsonObject root;
+    root["data"] = arr;
+    QJsonDocument doc(root);
+    QFile file((const char *)filepath);
+    if (file.open(QIODevice::WriteOnly))
+        file.write(doc.toJson(QJsonDocument::Compact));
+}
+
+bool msr_find_cached_art(const String & cid_or_url, String & out_path)
+{
+    if (!aud_get_bool("monster-siren", "enable_cache") || !aud_get_bool("monster-siren", "cache_images") || !cid_or_url)
+        return false;
+
+    String cache_dir = msr_get_cache_dir();
+    StringBuf art_dir = filename_build({cache_dir, "art"});
+    QString hash = msr_url_to_hash((const char *)cid_or_url);
+    StringBuf filepath = filename_build({art_dir, StringBuf(str_concat({"cover_", hash.toUtf8().constData(), ".jpg"}))});
+    if (QFile::exists((const char *)filepath)) {
+        out_path = String(filepath);
+        return true;
+    }
+    return false;
+}
+
+void msr_save_art_to_cache(const String & cid_or_url, const Index<char> & data)
+{
+    if (!aud_get_bool("monster-siren", "enable_cache") || !aud_get_bool("monster-siren", "cache_images") || !cid_or_url || !data.len())
+        return;
+
+    String cache_dir = msr_get_cache_dir();
+    StringBuf art_dir = filename_build({cache_dir, "art"});
+    QDir().mkpath(QString::fromUtf8((const char *)art_dir));
+
+    QString hash = msr_url_to_hash((const char *)cid_or_url);
+    StringBuf filepath = filename_build({art_dir, StringBuf(str_concat({"cover_", hash.toUtf8().constData(), ".jpg"}))});
+    QFile file((const char *)filepath);
+    if (file.open(QIODevice::WriteOnly))
+        file.write(data.begin(), data.len());
+}
+
+bool msr_find_cached_audio(const String & cid, String & out_path)
+{
+    if (!aud_get_bool("monster-siren", "enable_cache") || !aud_get_bool("monster-siren", "cache_audio") || !cid)
+        return false;
+
+    String cache_dir = msr_get_cache_dir();
+    StringBuf audio_dir = filename_build({cache_dir, "audio"});
+
+    const char * exts[] = {".mp3", ".flac", ".wav", ".aac", ".m4a", ".ogg", ".wma"};
+    for (const char * ext : exts) {
+        StringBuf filepath = filename_build({audio_dir, StringBuf(str_concat({"audio_", cid, ext}))});
+        if (QFile::exists((const char *)filepath)) {
+            out_path = String(filepath);
+            return true;
+        }
+    }
+    return false;
+}
+
+void msr_save_audio_to_cache(const String & cid, const String & sourceUrl, const Index<char> & data)
+{
+    if (!aud_get_bool("monster-siren", "enable_cache") || !aud_get_bool("monster-siren", "cache_audio") || !cid || !sourceUrl || !data.len())
+        return;
+
+    String cache_dir = msr_get_cache_dir();
+    StringBuf audio_dir = filename_build({cache_dir, "audio"});
+    QDir().mkpath(QString::fromUtf8((const char *)audio_dir));
+
+    const char * url_str = (const char *)sourceUrl;
+    const char * dot = strrchr(url_str, '.');
+    String ext = (dot && strlen(dot) <= 5) ? String(dot) : String(".mp3");
+    StringBuf filepath = filename_build({audio_dir, StringBuf(str_concat({"audio_", cid, ext}))});
+    QFile file((const char *)filepath);
+    if (file.open(QIODevice::WriteOnly))
+        file.write(data.begin(), data.len());
+}
+
+bool msr_find_cached_lyrics(const String & cid_or_url, String & out_path)
+{
+    if (!aud_get_bool("monster-siren", "enable_cache") || !aud_get_bool("monster-siren", "cache_audio") || !cid_or_url)
+        return false;
+
+    String cache_dir = msr_get_cache_dir();
+    StringBuf lyrics_dir = filename_build({cache_dir, "lyrics"});
+    QString hash = msr_url_to_hash((const char *)cid_or_url);
+    StringBuf filepath = filename_build({lyrics_dir, StringBuf(str_concat({"lyric_", hash.toUtf8().constData(), ".lrc"}))});
+    if (QFile::exists((const char *)filepath)) {
+        out_path = String(filepath);
+        return true;
+    }
+    return false;
+}
+
+void msr_save_lyrics_to_cache(const String & cid_or_url, const String & lyrics_text)
+{
+    if (!aud_get_bool("monster-siren", "enable_cache") || !aud_get_bool("monster-siren", "cache_audio") || !cid_or_url || !lyrics_text)
+        return;
+
+    String cache_dir = msr_get_cache_dir();
+    StringBuf lyrics_dir = filename_build({cache_dir, "lyrics"});
+    QDir().mkpath(QString::fromUtf8((const char *)lyrics_dir));
+
+    QString hash = msr_url_to_hash((const char *)cid_or_url);
+    StringBuf filepath = filename_build({lyrics_dir, StringBuf(str_concat({"lyric_", hash.toUtf8().constData(), ".lrc"}))});
+    QFile file((const char *)filepath);
+    if (file.open(QIODevice::WriteOnly))
+        file.write((const char *)lyrics_text, strlen((const char *)lyrics_text));
+}
+
+void msr_fetch_and_cache_audio_background(const String & cid, const String & sourceUrl)
+{
+    if (!cid || !sourceUrl || !aud_get_bool("monster-siren", "enable_cache") || !aud_get_bool("monster-siren", "cache_audio"))
+        return;
+    String path;
+    if (msr_find_cached_audio(cid, path))
+        return;
+    QByteArray bytes = msr_fetch_bytes(QString::fromUtf8((const char *)sourceUrl));
+    if (!bytes.isEmpty()) {
+        Index<char> data;
+        data.insert(bytes.constData(), 0, bytes.size());
+        msr_save_audio_to_cache(cid, sourceUrl, data);
+    }
+}
+
+std::vector<MsrAlbum> msr_fetch_albums(bool force_network)
+{
+    if (!force_network && aud_get_bool("monster-siren", "enable_cache") &&
+        aud_get_bool("monster-siren", "cache_catalog") &&
+        aud_get_bool("monster-siren", "manual_sync"))
     {
-        std::lock_guard<std::mutex> lock(g_cache_mutex);
-        if (g_albums_cached)
+        std::vector<MsrAlbum> disk_albums;
+        if (msr_load_catalog_from_cache(disk_albums)) {
+            std::lock_guard<std::mutex> lock(g_cache_mutex);
+            g_cached_albums = disk_albums;
+            g_albums_cached = true;
             return g_cached_albums;
+        }
     }
 
     QJsonDocument doc = msr_fetch_json("https://monster-siren.hypergryph.com/api/albums");
     std::vector<MsrAlbum> albums;
-    if (!doc.isObject())
+    if (!doc.isObject()) {
+        if (!force_network && msr_load_catalog_from_cache(albums)) {
+            std::lock_guard<std::mutex> lock(g_cache_mutex);
+            g_cached_albums = albums;
+            g_albums_cached = true;
+            return g_cached_albums;
+        }
         return albums;
+    }
 
     QJsonObject root = doc.object();
     QJsonArray list = root.value("data").toArray();
@@ -190,6 +418,9 @@ std::vector<MsrAlbum> msr_fetch_albums()
         albums.push_back(std::move(album));
     }
 
+    if (!albums.empty())
+        msr_save_catalog_to_cache(albums);
+
     {
         std::lock_guard<std::mutex> lock(g_cache_mutex);
         g_cached_albums = albums;
@@ -197,6 +428,142 @@ std::vector<MsrAlbum> msr_fetch_albums()
     }
 
     return albums;
+}
+
+bool msr_find_cached_album_detail(const String & cid, MsrAlbum & out_album)
+{
+    if (!aud_get_bool("monster-siren", "enable_cache") || !aud_get_bool("monster-siren", "cache_catalog") || !cid)
+        return false;
+
+    String cache_dir = msr_get_cache_dir();
+    StringBuf meta_dir = filename_build({cache_dir, "meta"});
+    StringBuf filepath = filename_build({meta_dir, StringBuf(str_concat({"album_", (const char *)cid, ".json"}))});
+    QFile file((const char *)filepath);
+    if (!file.open(QIODevice::ReadOnly))
+        return false;
+
+    QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+    if (!doc.isObject())
+        return false;
+
+    QJsonObject obj = doc.object();
+    out_album.cid = String(obj.value("cid").toString().toUtf8().constData());
+    out_album.name = String(obj.value("name").toString().toUtf8().constData());
+    out_album.coverUrl = String(obj.value("coverUrl").toString().toUtf8().constData());
+    out_album.artistes = String(obj.value("artistes").toString().toUtf8().constData());
+
+    QJsonArray tracks_arr = obj.value("tracks").toArray();
+    for (const QJsonValue & tv : tracks_arr) {
+        QJsonObject tobj = tv.toObject();
+        MsrTrack track;
+        track.cid = String(tobj.value("cid").toString().toUtf8().constData());
+        track.name = String(tobj.value("name").toString().toUtf8().constData());
+        track.artistes = String(tobj.value("artistes").toString().toUtf8().constData());
+        out_album.tracks.push_back(std::move(track));
+    }
+    return true;
+}
+
+void msr_save_album_detail_to_cache(const MsrAlbum & album)
+{
+    if (!aud_get_bool("monster-siren", "enable_cache") || !aud_get_bool("monster-siren", "cache_catalog") || !album.cid)
+        return;
+
+    String cache_dir = msr_get_cache_dir();
+    StringBuf meta_dir = filename_build({cache_dir, "meta"});
+    QDir().mkpath(QString::fromUtf8((const char *)meta_dir));
+
+    StringBuf filepath = filename_build({meta_dir, StringBuf(str_concat({"album_", (const char *)album.cid, ".json"}))});
+    QJsonObject obj;
+    obj["cid"] = (const char *)album.cid;
+    obj["name"] = (const char *)album.name;
+    obj["coverUrl"] = (const char *)album.coverUrl;
+    obj["artistes"] = (const char *)album.artistes;
+
+    QJsonArray tracks_arr;
+    for (const auto & trk : album.tracks) {
+        QJsonObject tobj;
+        tobj["cid"] = (const char *)trk.cid;
+        tobj["name"] = (const char *)trk.name;
+        tobj["artistes"] = (const char *)trk.artistes;
+        tracks_arr.append(tobj);
+    }
+    obj["tracks"] = tracks_arr;
+
+    QFile file((const char *)filepath);
+    if (file.open(QIODevice::WriteOnly))
+        file.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+}
+
+bool msr_find_cached_song_detail(const String & cid, MsrSongDetail & out_song)
+{
+    if (!aud_get_bool("monster-siren", "enable_cache") || !aud_get_bool("monster-siren", "cache_catalog") || !cid)
+        return false;
+
+    String cache_dir = msr_get_cache_dir();
+    StringBuf meta_dir = filename_build({cache_dir, "meta"});
+    StringBuf filepath = filename_build({meta_dir, StringBuf(str_concat({"song_", (const char *)cid, ".json"}))});
+    QFile file((const char *)filepath);
+    if (!file.open(QIODevice::ReadOnly))
+        return false;
+
+    QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+    if (!doc.isObject())
+        return false;
+
+    QJsonObject obj = doc.object();
+    out_song.cid = String(obj.value("cid").toString().toUtf8().constData());
+    out_song.name = String(obj.value("name").toString().toUtf8().constData());
+    out_song.albumCid = String(obj.value("albumCid").toString().toUtf8().constData());
+    out_song.sourceUrl = String(obj.value("sourceUrl").toString().toUtf8().constData());
+    out_song.lyricUrl = String(obj.value("lyricUrl").toString().toUtf8().constData());
+    out_song.mvCoverUrl = String(obj.value("mvCoverUrl").toString().toUtf8().constData());
+    out_song.artists = String(obj.value("artists").toString().toUtf8().constData());
+    out_song.duration_ms = obj.value("duration_ms").toInt(0);
+    return true;
+}
+
+void msr_save_song_detail_to_cache(const MsrSongDetail & song)
+{
+    if (!aud_get_bool("monster-siren", "enable_cache") || !aud_get_bool("monster-siren", "cache_catalog") || !song.cid)
+        return;
+
+    String cache_dir = msr_get_cache_dir();
+    StringBuf meta_dir = filename_build({cache_dir, "meta"});
+    QDir().mkpath(QString::fromUtf8((const char *)meta_dir));
+
+    StringBuf filepath = filename_build({meta_dir, StringBuf(str_concat({"song_", (const char *)song.cid, ".json"}))});
+    QJsonObject obj;
+    obj["cid"] = (const char *)song.cid;
+    obj["name"] = (const char *)song.name;
+    obj["albumCid"] = (const char *)song.albumCid;
+    obj["sourceUrl"] = (const char *)song.sourceUrl;
+    obj["lyricUrl"] = (const char *)song.lyricUrl;
+    obj["mvCoverUrl"] = (const char *)song.mvCoverUrl;
+    obj["artists"] = (const char *)song.artists;
+    obj["duration_ms"] = song.duration_ms;
+
+    QFile file((const char *)filepath);
+    if (file.open(QIODevice::WriteOnly))
+        file.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+
+    std::string key((const char *)song.cid);
+    std::lock_guard<std::mutex> lock(g_cache_mutex);
+    g_cached_song_details[key] = song;
+}
+
+void msr_invalidate_song_detail(const String & cid)
+{
+    if (!cid) return;
+    std::string key((const char *)cid);
+    {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        g_cached_song_details.erase(key);
+    }
+    String cache_dir = msr_get_cache_dir();
+    StringBuf meta_dir = filename_build({cache_dir, "meta"});
+    StringBuf filepath = filename_build({meta_dir, StringBuf(str_concat({"song_", (const char *)cid, ".json"}))});
+    QFile::remove((const char *)filepath);
 }
 
 MsrAlbum msr_fetch_album_detail(const String & cid)
@@ -210,6 +577,13 @@ MsrAlbum msr_fetch_album_detail(const String & cid)
         auto it = g_cached_album_details.find(key);
         if (it != g_cached_album_details.end())
             return it->second;
+    }
+
+    MsrAlbum disk_album;
+    if (msr_find_cached_album_detail(cid, disk_album)) {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        g_cached_album_details[key] = disk_album;
+        return disk_album;
     }
 
     QString url = QString("https://monster-siren.hypergryph.com/api/album/%1/detail").arg((const char *)cid);
@@ -245,6 +619,7 @@ MsrAlbum msr_fetch_album_detail(const String & cid)
         album.tracks.push_back(std::move(track));
     }
 
+    msr_save_album_detail_to_cache(album);
     {
         std::lock_guard<std::mutex> lock(g_cache_mutex);
         g_cached_album_details[key] = album;
@@ -264,6 +639,13 @@ MsrSongDetail msr_fetch_song_detail(const String & cid)
         auto it = g_cached_song_details.find(key);
         if (it != g_cached_song_details.end())
             return it->second;
+    }
+
+    MsrSongDetail disk_song;
+    if (msr_find_cached_song_detail(cid, disk_song)) {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        g_cached_song_details[key] = disk_song;
+        return disk_song;
     }
 
     QString url = QString("https://monster-siren.hypergryph.com/api/song/%1").arg((const char *)cid);
@@ -286,11 +668,7 @@ MsrSongDetail msr_fetch_song_detail(const String & cid)
         art_list.append(a.toString());
     detail.artists = String(art_list.join(", ").toUtf8().constData());
 
-    {
-        std::lock_guard<std::mutex> lock(g_cache_mutex);
-        g_cached_song_details[key] = detail;
-    }
-
+    msr_save_song_detail_to_cache(detail);
     return detail;
 }
 
@@ -311,10 +689,25 @@ Index<char> msr_fetch_image(const String & url)
         }
     }
 
+    String cached_path;
+    if (msr_find_cached_art(url, cached_path)) {
+        QFile file((const char *)cached_path);
+        if (file.open(QIODevice::ReadOnly)) {
+            QByteArray bytes = file.readAll();
+            if (!bytes.isEmpty()) {
+                result.insert(bytes.constData(), 0, bytes.size());
+                return result; // Return directly from disk cache without permanently holding inside g_cached_images RAM map
+            }
+        }
+    }
+
     QByteArray bytes = msr_fetch_bytes(QString::fromUtf8((const char *)url));
     if (!bytes.isEmpty()) {
         result.insert(bytes.constData(), 0, bytes.size());
+        msr_save_art_to_cache(url, result);
         std::lock_guard<std::mutex> lock(g_cache_mutex);
+        if (g_cached_images.size() >= 10)
+            g_cached_images.clear(); // Keep RAM memory footprint of g_cached_images strictly capped at <= 10 covers
         Index<char> cache_copy;
         cache_copy.insert(result.begin(), 0, result.len());
         g_cached_images[key] = std::move(cache_copy);
@@ -336,11 +729,30 @@ String msr_fetch_lyrics(const String & url)
             return it->second;
     }
 
+    String cached_path;
+    if (msr_find_cached_lyrics(url, cached_path)) {
+        AUDINFO("MSR: msr_fetch_lyrics cache hit for %s -> %s\n", (const char *)url, (const char *)cached_path);
+        QFile file((const char *)cached_path);
+        if (file.open(QIODevice::ReadOnly)) {
+            QByteArray bytes = file.readAll();
+            if (!bytes.isEmpty()) {
+                String result(bytes.constData());
+                std::lock_guard<std::mutex> lock(g_cache_mutex);
+                g_cached_lyrics[key] = result;
+                return result;
+            }
+        }
+    }
+
+    AUDINFO("MSR: msr_fetch_lyrics downloading over HTTPS: %s\n", (const char *)url);
     QByteArray bytes = msr_fetch_bytes(QString::fromUtf8((const char *)url));
-    if (bytes.isEmpty())
+    if (bytes.isEmpty()) {
+        AUDWARN("MSR: msr_fetch_lyrics failed or empty response for %s\n", (const char *)url);
         return String();
+    }
 
     String result(bytes.constData());
+    msr_save_lyrics_to_cache(url, result);
     {
         std::lock_guard<std::mutex> lock(g_cache_mutex);
         g_cached_lyrics[key] = result;
