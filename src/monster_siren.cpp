@@ -144,7 +144,15 @@ MsrUrlParsed msr_parse_url(const char * url)
             return result;
         }
 
-        // Check for song/music
+        // Check for /music/info/<cid> (album page URL) before generic /music/<cid> (song)
+        size_t music_info_pos = s.find("/music/info/");
+        if (music_info_pos != std::string::npos) {
+            std::string cid_str = s.substr(music_info_pos + 12);
+            result.cid = String(cid_str.c_str());
+            result.subtune_index = subtune;
+            result.type = (subtune > 0) ? MsrUrlType::AlbumTrack : MsrUrlType::Album;
+            return result;
+        }
         size_t music_pos = s.find("/music/");
         if (music_pos != std::string::npos) {
             std::string cid_str = s.substr(music_pos + 7);
@@ -316,8 +324,12 @@ void msr_save_audio_to_cache(const String & cid, const String & sourceUrl, const
     StringBuf audio_dir = filename_build({cache_dir, "audio"});
     QDir().mkpath(QString::fromUtf8((const char *)audio_dir));
 
-    const char * url_str = (const char *)sourceUrl;
-    const char * dot = strrchr(url_str, '.');
+    // Strip query parameters before finding extension (CDN URLs contain ?token=...)
+    std::string url_clean((const char *)sourceUrl);
+    size_t qmark = url_clean.find('?');
+    if (qmark != std::string::npos)
+        url_clean = url_clean.substr(0, qmark);
+    const char * dot = strrchr(url_clean.c_str(), '.');
     String ext = (dot && strlen(dot) <= 5) ? String(dot) : String(".mp3");
     StringBuf filepath = filename_build({audio_dir, StringBuf(str_concat({"audio_", cid, ext}))});
     QFile file((const char *)filepath);
@@ -374,6 +386,12 @@ void msr_fetch_and_cache_audio_background(const String & cid, const String & sou
 
 std::vector<MsrAlbum> msr_fetch_albums(bool force_network)
 {
+    if (!force_network) {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        if (g_albums_cached && !g_cached_albums.empty())
+            return g_cached_albums;
+    }
+
     if (!force_network && aud_get_bool("monster-siren", "enable_cache") &&
         aud_get_bool("monster-siren", "cache_catalog") &&
         aud_get_bool("monster-siren", "manual_sync"))

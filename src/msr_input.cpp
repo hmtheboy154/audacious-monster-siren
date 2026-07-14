@@ -76,7 +76,7 @@ public:
         PACKAGE,
         nullptr,
         nullptr,
-        0
+        PluginQtOnly
     };
 
     constexpr MsrInputPlugin()
@@ -193,8 +193,6 @@ public:
                     tuple.set_str(Tuple::Lyrics, String("[No lyrics provided by Monster Siren]"));
             }
 
-            tuple.set_int(Tuple::StartTime, 0);
-            tuple.set_str(Tuple::AudioFile, filename);
             return true;
         }
 
@@ -264,8 +262,6 @@ public:
                     tuple.set_str(Tuple::Lyrics, String("[No lyrics provided by Monster Siren]"));
             }
 
-            tuple.set_int(Tuple::StartTime, 0);
-            tuple.set_str(Tuple::AudioFile, filename);
             return true;
         }
 

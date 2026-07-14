@@ -450,18 +450,24 @@ private:
         if (m_images_loaded.exchange(true))
             return;
 
-        QPointer<MonsterSirenCatalogWidget> guard(this);
-        std::thread([guard]() {
-            if (!guard || !guard->m_model) return;
-            int count = guard->m_model->rowCount();
-            for (int i = 0; i < count; i++) {
-                if (!guard) return;
-                QStandardItem * item = guard->m_model->item(i, 0);
-                if (!item) continue;
-                QString cover_url = item->data(Qt::UserRole + 2).toString();
-                if (cover_url.isEmpty()) continue;
+        // Collect cover URLs on the GUI thread to avoid concurrent model access
+        struct CoverInfo { int row; QString url; };
+        std::vector<CoverInfo> covers;
+        int count = m_model->rowCount();
+        for (int i = 0; i < count; i++) {
+            QStandardItem * item = m_model->item(i, 0);
+            if (!item) continue;
+            QString cover_url = item->data(Qt::UserRole + 2).toString();
+            if (!cover_url.isEmpty())
+                covers.push_back({i, cover_url});
+        }
 
-                Index<char> img_bytes = msr_fetch_image(String(cover_url.toUtf8().constData()));
+        QPointer<MonsterSirenCatalogWidget> guard(this);
+        std::thread([guard, covers = std::move(covers)]() {
+            for (const auto & info : covers) {
+                if (!guard) return;
+
+                Index<char> img_bytes = msr_fetch_image(String(info.url.toUtf8().constData()));
                 if (!guard || !img_bytes.len()) continue;
 
                 QByteArray qbytes(img_bytes.begin(), img_bytes.len());
@@ -472,13 +478,17 @@ private:
                 }
                 if (img.isNull()) continue;
 
-                QMetaObject::invokeMethod(guard.data(), [guard, item, img]() {
-                    if (!guard || !item) return;
-                    item->setIcon(QIcon(QPixmap::fromImage(img)));
+                int row = info.row;
+                QMetaObject::invokeMethod(guard.data(), [guard, row, img]() {
+                    if (!guard || !guard->m_model) return;
+                    QStandardItem * item = guard->m_model->item(row, 0);
+                    if (item)
+                        item->setIcon(QIcon(QPixmap::fromImage(img)));
                 }, Qt::QueuedConnection);
             }
         }).detach();
     }
+
 
     void refresh_catalog()
     {
