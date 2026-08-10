@@ -6,13 +6,14 @@ A flagship, feature-rich Audacious plugin suite that fetches, catalogs, caches, 
 
 - **Audacious 4.6.1 or above** (`libaudcore`, `libaudqt` headers and libraries)
 - **Qt 6** (`Core`, `Network`, `Widgets`) or Qt 5
+- **GTK 3** (`libgtk-3` dev headers) for the GTK3 catalog UI
 - **CMake 3.16+** and a C++20 compatible compiler
 
 ---
 
 ## Features & Architecture
 
-This project builds two synergistic Audacious plugin modules powered by a high-performance, multi-threaded, and offline-capable C++ backend (`libmsr_backend.a`):
+This project builds three synergistic Audacious plugin modules powered by a high-performance, multi-threaded, and offline-capable C++ backend (`libmsr_backend.a`):
 
 ### 1. Monster Siren Input Plugin (`monster-siren-input.so`)
 - **URL & Scheme Recognition**: Automatically recognizes URLs from `https://monster-siren.hypergryph.com` or custom `msr://` URIs (`msr://album/<cid>` and `msr://song/<cid>`) when opened via Audacious' **Open URL** (`Ctrl+L`) or **Add URL** dialogs.
@@ -23,7 +24,11 @@ This project builds two synergistic Audacious plugin modules powered by a high-p
   - **Fast Scan Mode (`image == null`)**: When Audacious scans tracks to populate playlist table rows, duration and lyrics are read instantly from local cache (`0 ms`) without making blocking network requests.
   - **Playback Preparation Mode (`image != null`)**: Right before `setup_playback()` runs (`or on right-click -> View Song Info`), exact lyrics and duration are verified and populated, ensuring the dockable `Lyrics` window shows synchronized lines immediately without triggering slow online provider timeouts or UI freezes.
 
-### 2. Monster Siren Catalog UI & Settings (`monster-siren-ui.so`)
+### 2. Monster Siren Catalog UI & Settings
+
+A native dockable catalog window is provided for both Audacious interfaces, sharing the same backend, settings, and view modes:
+
+**Qt (`monster-siren-ui.so`, `PluginQtOnly`)**
 - **Multi-Mode Dockable Catalog Window**: Adds a dedicated dockable panel ("Monster Siren Catalog") to Audacious's Qt Interface with asynchronous background loading (`std::thread` + `QMetaObject::invokeMethod`) for zero startup delay. Features three switchable view layouts (`View` button in header bar or Preferences):
   1. **Simple List (`QTreeView`)**: Compact tabular list showing Album Title and Artistes with RAM conservation options.
   2. **Album List (`QListView`)**: Vertical card list rendering cover art thumbnails (64x64+), bold titles, and artist subtitles.
@@ -34,6 +39,11 @@ This project builds two synergistic Audacious plugin modules powered by a high-p
   - **Granular Checkboxes**: Individual toggles for `Cache Catalog Data`, `Cache Album & Song Metadata`, `Cache Cover Art Images`, `Cache Audio Files (.mp3/.flac/.wav)`, and `Cache Lyrics (.lrc)`.
   - **Background Audio Caching**: When `Cache Audio Files` is enabled, tracks being played over the network automatically buffer and save to local disk on a background thread (`msr_fetch_and_cache_audio_background`), allowing transparent `file://` offline playback on subsequent listens.
   - **Manual Sync Mode**: Run 100% offline from local disk caches without network queries until explicitly forcing a catalog refresh via the top header bar (`Refresh` button).
+
+**GTK 3 (`monster-siren-gtk.so`, `PluginGLibOnly`)**:
+- **Native GTK3 Dockable Window**: The same catalog experience (Simple List / Album List / Grid views, instant search, refresh button, double-click playback) as a GTK3 General plugin dockable panel for `audacious -i gtk`, with asynchronous workers marshaled via `g_idle_add()`.
+- **Live View & Settings Sync**: The in-window view combo and the plugin settings apply immediately to the open window; the shared `[monster-siren]` defaults are registered in GTK mode too (`aud_config_set_defaults`), so both interfaces read and write identical options.
+- **Simple List Thumbnails**: The `Show album art icons in Simple List mode` option renders 32px thumbnails in list rows, identical to Qt behavior.
 
 ---
 
