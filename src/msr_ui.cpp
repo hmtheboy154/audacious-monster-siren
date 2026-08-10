@@ -65,14 +65,14 @@ static const ComboItem view_mode_elems[] = {
 static const PreferencesWidget msr_ui_widgets[] = {
     WidgetCheck(N_("Enable dockable catalog window"),
                 WidgetBool("monster-siren", "enable_dedicated_window", on_window_enable_changed)),
-    WidgetLabel(N_("<b>Catalog View & Layout</b>"), WIDGET_CHILD),
+    WidgetLabel(N_("<b>Catalog View &amp; Layout</b>"), WIDGET_CHILD),
     WidgetCombo(N_("Default Catalog View Mode"),
                 WidgetInt("monster-siren", "default_view_mode"),
                 WidgetVCombo{{view_mode_elems}, nullptr}, WIDGET_CHILD),
     WidgetCheck(N_("Show album art icons in Simple List mode (uses more RAM)"),
                 WidgetBool("monster-siren", "simple_mode_art"), WIDGET_CHILD),
     WidgetSeparator(),
-    WidgetLabel(N_("<b>Disk Caching & Offline Indexing</b>")),
+    WidgetLabel(N_("<b>Disk Caching &amp; Offline Indexing</b>")),
     WidgetCheck(N_("Enable Offline Disk Cache & Indexing"),
                 WidgetBool("monster-siren", "enable_cache")),
     WidgetFileEntry(N_("Cache Directory"),
@@ -111,6 +111,11 @@ public:
         aud_config_set_defaults("monster-siren", msr_ui_defaults);
         msr_get_cache_dir(); // populate default cache dir right at startup for UI display
         return true;
+    }
+
+    void cleanup() override
+    {
+        msr_wait_for_background_threads();
     }
 
     void * get_qt_widget() override;
@@ -380,8 +385,8 @@ public:
         });
 
         connect(m_refresh_btn, &QPushButton::clicked, this, [this]() {
-            msr_cache_clear();
-            refresh_catalog();
+            msr_invalidate_catalog_cache();
+            refresh_catalog(true);
         });
 
         connect(m_tree, &QTreeView::doubleClicked, this, &MonsterSirenCatalogWidget::on_item_activated);
@@ -463,7 +468,7 @@ private:
         }
 
         QPointer<MonsterSirenCatalogWidget> guard(this);
-        std::thread([guard, covers = std::move(covers)]() {
+        msr_run_background([guard, covers = std::move(covers)]() {
             for (const auto & info : covers) {
                 if (!guard) return;
 
@@ -486,11 +491,11 @@ private:
                         item->setIcon(QIcon(QPixmap::fromImage(img)));
                 }, Qt::QueuedConnection);
             }
-        }).detach();
+        });
     }
 
 
-    void refresh_catalog()
+    void refresh_catalog(bool force_network = false)
     {
         m_model->removeRows(0, m_model->rowCount());
         m_status_label->setText(QString::fromUtf8(_("Loading Monster Siren catalog...")));
@@ -498,8 +503,8 @@ private:
             m_refresh_btn->setEnabled(false);
 
         QPointer<MonsterSirenCatalogWidget> guard(this);
-        std::thread([guard]() {
-            std::vector<MsrAlbum> albums = msr_fetch_albums();
+        msr_run_background([guard, force_network]() {
+            std::vector<MsrAlbum> albums = msr_fetch_albums(force_network);
             if (!guard)
                 return;
             QMetaObject::invokeMethod(guard.data(), [guard, albums = std::move(albums)]() {
@@ -507,7 +512,7 @@ private:
                     return;
                 guard->populate_catalog(albums);
             }, Qt::QueuedConnection);
-        }).detach();
+        });
     }
 
     void on_item_activated(const QModelIndex & proxy_index)
