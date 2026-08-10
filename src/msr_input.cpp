@@ -17,14 +17,59 @@
 #include <libaudcore/audstrings.h>
 #include <vector>
 #include <thread>
+#include <cstring>
 
 static const char * const msr_schemes[] = {"msr", nullptr};
 
 /**
- * Helper function to probe remote audio stream duration over VFS.
- * By querying the underlying audio decoder (e.g. sndfile or ffaudio) before playback,
- * we ensure Tuple::Length is set (> 0). This enables Audacious to display exact track
- * timestamps on the seekbar and permits seeking via HTTP byte-range requests.
+ * Parses a RIFF/WAVE header from an open VFSFile using a bounded read and
+ * derives the stream duration from the fmt/data chunks. Unlike delegating to
+ * the sndfile decoder, this never fseeks to the end of the stream, so probing
+ * a remote file no longer forces the HTTP transport to download the entire
+ * track (e.g. a 70MB WAV) just to learn its length.
+ */
+static bool probe_wav_length(VFSFile & file, Tuple & target_tuple)
+{
+    char buf[65536];
+    int64_t n = file.fread(buf, 1, sizeof(buf));
+    if (n < 12 || memcmp(buf, "RIFF", 4) || memcmp(buf + 8, "WAVE", 4))
+        return false;
+
+    auto le32 = [](const char * p) {
+        return (uint32_t)(uint8_t)p[0] | ((uint32_t)(uint8_t)p[1] << 8) |
+               ((uint32_t)(uint8_t)p[2] << 16) | ((uint32_t)(uint8_t)p[3] << 24);
+    };
+
+    int64_t pos = 12;
+    uint32_t byte_rate = 0, data_size = 0;
+    bool have_fmt = false;
+
+    while (pos + 8 <= n) {
+        uint32_t chunk_size = le32(buf + pos + 4);
+        if (memcmp(buf + pos, "fmt ", 4) == 0 && chunk_size >= 16 && pos + 8 + 16 <= n) {
+            byte_rate = le32(buf + pos + 16);
+            have_fmt = true;
+        } else if (memcmp(buf + pos, "data", 4) == 0) {
+            data_size = chunk_size;
+            break;
+        }
+        pos += 8 + chunk_size + (chunk_size & 1);
+    }
+
+    if (have_fmt && byte_rate > 0 && data_size > 0) {
+        target_tuple.set_int(Tuple::Length, (int)((int64_t)data_size * 1000 / byte_rate));
+        target_tuple.set_int(Tuple::Bitrate, (int)byte_rate * 8);
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Helper function to probe audio stream duration over VFS.
+ * By parsing the RIFF header (or, for offline files only, querying the
+ * underlying audio decoder) before playback, we ensure Tuple::Length is set
+ * (> 0). This enables Audacious to display exact track timestamps on the
+ * seekbar and permits seeking via HTTP byte-range requests.
  */
 static void probe_remote_length(const String & cid, const String & sourceUrl, Tuple & target_tuple)
 {
@@ -33,7 +78,8 @@ static void probe_remote_length(const String & cid, const String & sourceUrl, Tu
 
     String probe_url = sourceUrl;
     String cached_path;
-    if (cid && msr_find_cached_audio(cid, cached_path)) {
+    bool use_cache = cid && msr_find_cached_audio(cid, cached_path);
+    if (use_cache) {
         probe_url = String(StringBuf(str_concat({"file://", cached_path})));
         AUDINFO("MSR: probe_remote_length using local audio cache for cid %s -> %s\n", (const char *)cid, (const char *)probe_url);
     } else {
@@ -45,6 +91,22 @@ static void probe_remote_length(const String & cid, const String & sourceUrl, Tu
         AUDWARN("MSR: probe_remote_length failed to open VFSFile for %s\n", (const char *)probe_url);
         return;
     }
+    if (probe_wav_length(probe_file, target_tuple)) {
+        AUDINFO("MSR: probe_remote_length (header parse) success for cid %s -> Length: %d ms, Bitrate: %d\n",
+                (const char *)cid, target_tuple.get_int(Tuple::Length), target_tuple.get_int(Tuple::Bitrate));
+        return;
+    }
+
+    /* Full decoder probing is only safe for local files; on a remote URL the
+     * decoder's end-of-stream seek would download the whole track. */
+    if (!use_cache) {
+        AUDINFO("MSR: probe_remote_length: no RIFF header for %s, length stays unknown\n", (const char *)probe_url);
+        return;
+    }
+
+    if (probe_file.fseek(0, VFS_SEEK_SET) != 0) {
+        /* proceed anyway if seek fails */
+    }
     PluginHandle * decoder = aud_file_find_decoder(probe_url, true, probe_file);
     if (!decoder)
         decoder = aud_file_find_decoder(probe_url, false, probe_file);
@@ -55,9 +117,6 @@ static void probe_remote_length(const String & cid, const String & sourceUrl, Tu
     auto ip = (InputPlugin *)aud_plugin_get_header(decoder);
     if (!ip)
         return;
-    if (probe_file.fseek(0, VFS_SEEK_SET) != 0) {
-        /* proceed anyway if seek fails on non-seekable stream */
-    }
     Tuple stream_tuple;
     if (ip->read_tag(probe_url, probe_file, stream_tuple, nullptr)) {
         if (stream_tuple.get_int(Tuple::Length) > 0)
@@ -84,6 +143,19 @@ public:
                                 .with_schemes(msr_schemes)
                                 .with_priority(1))
     {
+    }
+
+    bool init() override
+    {
+        return true;
+    }
+
+    /* Audacious dlcloses plugin modules at exit; join any in-flight
+     * background cache downloads (after aborting their transfer loop) so they
+     * never execute into freed transport/OpenSSL code after module unload. */
+    void cleanup() override
+    {
+        msr_wait_for_background_threads();
     }
 
     /**
@@ -150,46 +222,44 @@ public:
                 AUDINFO("MSR: read_tag (SCAN/FAST mode, image=null) for %s (cid: %s)\n", filename, (const char *)track.cid);
             }
 
-            // Probe duration fast from disk cache, or probe remotely when preparing for playback (image != nullptr)
+            // Probe track duration: read it from memory/disk cache when already
+            // known, otherwise probe the stream (using the local audio cache
+            // file when one exists). Probing during the catalog scan (image ==
+            // nullptr) as well as during playback prep makes Tuple::Length
+            // deterministic, which is what enables the seekbar / timestamp
+            // seeking in Audacious.
             if (tuple.get_int(Tuple::Length) <= 0) {
                 MsrSongDetail song = msr_fetch_song_detail(track.cid);
                 if (song.duration_ms > 0) {
                     tuple.set_int(Tuple::Length, song.duration_ms);
-                } else if (image && song.sourceUrl && song.sourceUrl[0]) {
-                    AUDINFO("MSR: Probing remote duration during playback prep for cid %s\n", (const char *)track.cid);
+                } else if (song.sourceUrl && song.sourceUrl[0]) {
+                    AUDINFO("MSR: Probing duration for cid %s (%s)\n", (const char *)track.cid,
+                            image ? "playback prep" : "catalog scan");
                     probe_remote_length(track.cid, song.sourceUrl, tuple);
                     if (tuple.get_int(Tuple::Length) > 0) {
                         song.duration_ms = tuple.get_int(Tuple::Length);
                         msr_save_song_detail_to_cache(song);
                     }
-                } else {
-                    String cached_path;
-                    if (msr_find_cached_audio(track.cid, cached_path) && song.sourceUrl && song.sourceUrl[0]) {
-                        probe_remote_length(track.cid, song.sourceUrl, tuple);
-                        if (tuple.get_int(Tuple::Length) > 0) {
-                            song.duration_ms = tuple.get_int(Tuple::Length);
-                            msr_save_song_detail_to_cache(song);
-                        }
-                    }
                 }
             }
 
-            // Populate lyrics directly from local cache, or fetch over network during playback preparation (image != nullptr)
+            // Populate lyrics (Tuple::Lyrics) in both scan and playback modes so
+            // Audacious's lyric plugins (lyrics-qt, lyrics-gtk) show Monster
+            // Siren's own lyrics instead of falling back to third-party sources.
+            // A placeholder is always set when MSR provides no lyrics.
             if (!tuple.get_str(Tuple::Lyrics)) {
                 MsrSongDetail song = msr_fetch_song_detail(track.cid);
-                String cached_lyric_path;
-                if (msr_find_cached_lyrics(song.lyricUrl, cached_lyric_path)) {
-                    AUDINFO("MSR: Loading lyrics from local cache in read_tag for cid %s\n", (const char *)track.cid);
-                    String lyrics = msr_fetch_lyrics(song.lyricUrl);
-                    if (lyrics && lyrics[0])
-                        tuple.set_str(Tuple::Lyrics, lyrics);
-                } else if (image && song.lyricUrl && song.lyricUrl[0]) {
-                    AUDINFO("MSR: Fetching remote lyrics during playback prep for cid %s\n", (const char *)track.cid);
+                if (song.lyricUrl && song.lyricUrl[0]) {
+                    String cached_lyric_path;
+                    if (msr_find_cached_lyrics(song.lyricUrl, cached_lyric_path))
+                        AUDINFO("MSR: Loading lyrics from local cache in read_tag for cid %s\n", (const char *)track.cid);
+                    else
+                        AUDINFO("MSR: Fetching remote lyrics in read_tag for cid %s\n", (const char *)track.cid);
                     String lyrics = msr_fetch_lyrics(song.lyricUrl);
                     if (lyrics && lyrics[0])
                         tuple.set_str(Tuple::Lyrics, lyrics);
                 }
-                if (image && !tuple.get_str(Tuple::Lyrics))
+                if (!tuple.get_str(Tuple::Lyrics))
                     tuple.set_str(Tuple::Lyrics, String("[No lyrics provided by Monster Siren]"));
             }
 
@@ -226,39 +296,29 @@ public:
             if (tuple.get_int(Tuple::Length) <= 0) {
                 if (song.duration_ms > 0) {
                     tuple.set_int(Tuple::Length, song.duration_ms);
-                } else if (image && song.sourceUrl && song.sourceUrl[0]) {
-                    AUDINFO("MSR: Probing remote duration during playback prep for standalone song cid %s\n", (const char *)song.cid);
+                } else if (song.sourceUrl && song.sourceUrl[0]) {
+                    AUDINFO("MSR: Probing duration for standalone song cid %s (%s)\n", (const char *)song.cid,
+                            image ? "playback prep" : "catalog scan");
                     probe_remote_length(song.cid, song.sourceUrl, tuple);
                     if (tuple.get_int(Tuple::Length) > 0) {
                         song.duration_ms = tuple.get_int(Tuple::Length);
                         msr_save_song_detail_to_cache(song);
                     }
-                } else {
-                    String cached_path;
-                    if (msr_find_cached_audio(song.cid, cached_path) && song.sourceUrl && song.sourceUrl[0]) {
-                        probe_remote_length(song.cid, song.sourceUrl, tuple);
-                        if (tuple.get_int(Tuple::Length) > 0) {
-                            song.duration_ms = tuple.get_int(Tuple::Length);
-                            msr_save_song_detail_to_cache(song);
-                        }
-                    }
                 }
             }
 
             if (!tuple.get_str(Tuple::Lyrics)) {
-                String cached_lyric_path;
-                if (msr_find_cached_lyrics(song.lyricUrl, cached_lyric_path)) {
-                    AUDINFO("MSR: Loading lyrics from local cache in read_tag for standalone song cid %s\n", (const char *)song.cid);
-                    String lyrics = msr_fetch_lyrics(song.lyricUrl);
-                    if (lyrics && lyrics[0])
-                        tuple.set_str(Tuple::Lyrics, lyrics);
-                } else if (image && song.lyricUrl && song.lyricUrl[0]) {
-                    AUDINFO("MSR: Fetching remote lyrics during playback prep for standalone song cid %s\n", (const char *)song.cid);
+                if (song.lyricUrl && song.lyricUrl[0]) {
+                    String cached_lyric_path;
+                    if (msr_find_cached_lyrics(song.lyricUrl, cached_lyric_path))
+                        AUDINFO("MSR: Loading lyrics from local cache in read_tag for standalone song cid %s\n", (const char *)song.cid);
+                    else
+                        AUDINFO("MSR: Fetching remote lyrics in read_tag for standalone song cid %s\n", (const char *)song.cid);
                     String lyrics = msr_fetch_lyrics(song.lyricUrl);
                     if (lyrics && lyrics[0])
                         tuple.set_str(Tuple::Lyrics, lyrics);
                 }
-                if (image && !tuple.get_str(Tuple::Lyrics))
+                if (!tuple.get_str(Tuple::Lyrics))
                     tuple.set_str(Tuple::Lyrics, String("[No lyrics provided by Monster Siren]"));
             }
 
@@ -303,9 +363,9 @@ public:
             AUDINFO("Playing Monster Siren track %s directly from offline disk cache: %s\n", (const char *)song.name, (const char *)cached_path);
             stream_url = String(StringBuf(str_concat({"file://", cached_path})));
         } else if (aud_get_bool("monster-siren", "enable_cache") && aud_get_bool("monster-siren", "cache_audio") && song.sourceUrl) {
-            std::thread([cid = String(song.cid), sourceUrl = String(song.sourceUrl)]() {
+            msr_run_background([cid = String(song.cid), sourceUrl = String(song.sourceUrl)]() {
                 msr_fetch_and_cache_audio_background(cid, sourceUrl);
-            }).detach();
+            });
         }
 
         AUDINFO("Streaming Monster Siren track %s from URL: %s\n", (const char *)song.name, (const char *)stream_url);
@@ -350,27 +410,10 @@ public:
         Tuple t;
         read_tag(filename, file, t, nullptr);
         if (t.get_int(Tuple::Length) <= 0) {
-            if (source_file.fseek(0, VFS_SEEK_SET) != 0) {
-                /* proceed anyway if seek fails on non-seekable stream */
-            }
-            Tuple stream_tuple;
-            if (ip->read_tag(stream_url, source_file, stream_tuple, nullptr)) {
-                if (stream_tuple.get_int(Tuple::Length) > 0) {
-                    t.set_int(Tuple::Length, stream_tuple.get_int(Tuple::Length));
-                    if (song.duration_ms <= 0) {
-                        song.duration_ms = stream_tuple.get_int(Tuple::Length);
-                        msr_save_song_detail_to_cache(song);
-                    }
-                }
-                if (stream_tuple.get_int(Tuple::Bitrate) > 0)
-                    t.set_int(Tuple::Bitrate, stream_tuple.get_int(Tuple::Bitrate));
-            }
-            if (t.get_int(Tuple::Length) <= 0) {
-                probe_remote_length(song.cid, stream_url, t);
-                if (t.get_int(Tuple::Length) > 0 && song.duration_ms <= 0) {
-                    song.duration_ms = t.get_int(Tuple::Length);
-                    msr_save_song_detail_to_cache(song);
-                }
+            probe_remote_length(song.cid, stream_url, t);
+            if (t.get_int(Tuple::Length) > 0 && song.duration_ms <= 0) {
+                song.duration_ms = t.get_int(Tuple::Length);
+                msr_save_song_detail_to_cache(song);
             }
         }
 
