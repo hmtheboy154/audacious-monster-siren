@@ -9,11 +9,7 @@
  * 4. URL parsing (`msr_parse_url`) converting custom `msr://` and web URLs into structured routing entities.
  */
 
-#include <QCoreApplication>
-#include <QEventLoop>
-#include <QNetworkAccessManager>
-#include <QNetworkReply>
-#include <QNetworkRequest>
+#include <libaudcore/vfs.h>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -50,26 +46,14 @@ static std::map<std::string, String> g_cached_lyrics;
  */
 static QByteArray msr_fetch_bytes(const QString & url)
 {
-    if (!qApp)
-        return QByteArray();
-
+    String aud_url(url.toUtf8().constData());
     for (int attempt = 0; attempt < 3; attempt++) {
-        QNetworkAccessManager manager;
-        QNetworkRequest request((QUrl(url)));
-        request.setHeader(QNetworkRequest::UserAgentHeader, "Audacious-MonsterSiren-Plugin/1.0");
-        
-        QNetworkReply * reply = manager.get(request);
-        QEventLoop loop;
-        QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-        loop.exec();
-
-        QByteArray data;
-        if (reply->error() == QNetworkReply::NoError) {
-            data = reply->readAll();
-            reply->deleteLater();
-            return data;
+        VFSFile file(aud_url, "r");
+        if (file) {
+            Index<char> buf = file.read_all();
+            if (buf.len() > 0)
+                return QByteArray(buf.begin(), buf.len());
         }
-        reply->deleteLater();
         if (attempt < 2)
             QThread::msleep(150 * (attempt + 1));
     }

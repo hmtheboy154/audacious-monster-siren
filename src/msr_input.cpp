@@ -76,7 +76,7 @@ public:
         PACKAGE,
         nullptr,
         nullptr,
-        PluginQtOnly
+        0
     };
 
     constexpr MsrInputPlugin()
