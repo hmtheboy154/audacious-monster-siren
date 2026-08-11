@@ -86,38 +86,18 @@ static const PreferencesWidget msr_gtk_widgets[] = {
                 WidgetInt("monster-siren", "default_view_mode"),
                 WidgetVCombo{{view_mode_elems}, nullptr}, WIDGET_CHILD),
     WidgetCheck(N_("Show album art icons in Simple List mode (uses more RAM)"),
-                WidgetBool("monster-siren", "simple_mode_art"), WIDGET_CHILD),
-    WidgetSeparator(),
-    WidgetLabel(N_("<b>Disk Caching &amp; Offline Indexing</b>")),
-    WidgetCheck(N_("Enable Offline Disk Cache & Indexing"),
-                WidgetBool("monster-siren", "enable_cache")),
-    WidgetFileEntry(N_("Cache Directory"),
-                    WidgetString("monster-siren", "cache_dir"),
-                    {FileSelectMode::Folder}, WIDGET_CHILD),
-    WidgetCheck(N_("Cache Catalog Metadata Index"),
-                WidgetBool("monster-siren", "cache_catalog"), WIDGET_CHILD),
-    WidgetCheck(N_("Cache Album Cover Art Images"),
-                WidgetBool("monster-siren", "cache_images"), WIDGET_CHILD),
-    WidgetCheck(N_("Cache Audio Tracks & Lyrics during playback"),
-                WidgetBool("monster-siren", "cache_audio"), WIDGET_CHILD),
-    WidgetCheck(N_("Manual Sync Mode (Load only from disk until forced refresh)"),
-                WidgetBool("monster-siren", "manual_sync"), WIDGET_CHILD)
+                WidgetBool("monster-siren", "simple_mode_art"), WIDGET_CHILD)
 };
 
 static const PluginPreferences msr_gtk_prefs = {.widgets = msr_gtk_widgets, .init = nullptr, .apply = msr_gtk_prefs_apply, .cleanup = nullptr};
 
 /* The Qt UI module registers these defaults, but it is PluginQtOnly and never
  * loads in GTK mode, leaving the shared [monster-siren] options unregistered
- * here. Register them so both prefs widgets read/write consistently. */
+ * here. Register the view-mode keys so both prefs widgets read/write
+ * consistently; the disk caching keys are owned by the input plugin. */
 static const char * const msr_gtk_defaults[] = {
     "enable_dedicated_window", "TRUE",
     "simple_mode_art", "FALSE",
-    "enable_cache", "FALSE",
-    "cache_dir", "",
-    "cache_catalog", "TRUE",
-    "cache_images", "TRUE",
-    "cache_audio", "TRUE",
-    "manual_sync", "FALSE",
     "default_view_mode", "0",
     nullptr
 };

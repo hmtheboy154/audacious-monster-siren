@@ -15,11 +15,45 @@
 #include <libaudcore/vfs.h>
 #include <libaudcore/runtime.h>
 #include <libaudcore/audstrings.h>
+#include <libaudcore/preferences.h>
 #include <vector>
 #include <thread>
 #include <cstring>
 
 static const char * const msr_schemes[] = {"msr", nullptr};
+
+/* Defaults for the shared [monster-siren] settings that this module owns.
+ * The UI modules only register the view-mode options, so registering the
+ * caching keys here keeps them defined whenever the input plugin (which
+ * actually executes the caching) is present. */
+static const char * const msr_input_defaults[] = {
+    "enable_cache", "FALSE",
+    "cache_dir", "",
+    "cache_catalog", "TRUE",
+    "cache_images", "TRUE",
+    "cache_audio", "TRUE",
+    "manual_sync", "FALSE",
+    nullptr
+};
+
+static const PreferencesWidget msr_input_widgets[] = {
+    WidgetLabel(N_("<b>Disk Caching &amp; Offline Indexing</b>")),
+    WidgetCheck(N_("Enable Offline Disk Cache & Indexing"),
+                WidgetBool("monster-siren", "enable_cache")),
+    WidgetFileEntry(N_("Cache Directory"),
+                    WidgetString("monster-siren", "cache_dir"),
+                    {FileSelectMode::Folder}, WIDGET_CHILD),
+    WidgetCheck(N_("Cache Catalog Metadata Index"),
+                WidgetBool("monster-siren", "cache_catalog"), WIDGET_CHILD),
+    WidgetCheck(N_("Cache Album Cover Art Images"),
+                WidgetBool("monster-siren", "cache_images"), WIDGET_CHILD),
+    WidgetCheck(N_("Cache Audio Tracks & Lyrics during playback"),
+                WidgetBool("monster-siren", "cache_audio"), WIDGET_CHILD),
+    WidgetCheck(N_("Manual Sync Mode (Load only from disk until forced refresh)"),
+                WidgetBool("monster-siren", "manual_sync"), WIDGET_CHILD)
+};
+
+static const PluginPreferences msr_input_prefs = {.widgets = msr_input_widgets, .init = nullptr, .apply = nullptr, .cleanup = nullptr};
 
 /**
  * Parses a RIFF/WAVE header from an open VFSFile using a bounded read and
@@ -134,7 +168,7 @@ public:
         N_("Monster Siren Input Plugin"),
         PACKAGE,
         nullptr,
-        nullptr,
+        &msr_input_prefs,
         0
     };
 
@@ -147,6 +181,7 @@ public:
 
     bool init() override
     {
+        aud_config_set_defaults("monster-siren", msr_input_defaults);
         return true;
     }
 
