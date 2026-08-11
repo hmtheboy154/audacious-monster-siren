@@ -129,3 +129,17 @@ Or, if testing locally with a custom Audacious prefix:
 cmake -B build -S . -DCMAKE_INSTALL_PREFIX=/path/to/audacious
 cmake --build build -j$(nproc) && cmake --install build
 ```
+
+---
+
+## Credits
+
+Inspired by [MSRD](https://github.com/Meph1sto666/MSRD), a third-party downloader for the Monster Siren OST by Meph1sto666, which was referenced while implementing the Monster Siren API client.
+
+---
+
+## License
+
+Released under the Apache License 2.0. See [`LICENSE`](LICENSE).
+
+Note that the license applies to this project's code only; the Monster Siren catalog content (album names, cover art, audio tracks, and lyrics) is the property of [Hypergryph](https://www.hypergryph.com/).

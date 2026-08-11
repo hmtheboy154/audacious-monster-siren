@@ -70,3 +70,4 @@ We use a custom virtual filesystem scheme:
   - Limit the subject line to 50 characters.
   - Wrap the body text at **72 characters** (use a proper newline format instead of infinitely long lines).
   - Explain *why* a change was made, especially for thread-safety or architecture decisions.
+- **License**: The project is released under the **Apache License 2.0** (see `LICENSE`). The license is carried in the LICENSE file only — do **not** add per-file SPDX headers or copyright notices to source files.
