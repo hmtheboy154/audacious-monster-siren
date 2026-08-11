@@ -57,6 +57,10 @@ We use a custom virtual filesystem scheme:
 - **Simple List thumbnails**: The list renderer binds `COL_ICON_SMALL` (32 px) in Simple List and `COL_ICON` in Album List/Grid. Equal-set both columns when images load.
 - **Diagnostics**: Trace view switches and page attaches with `AUDWARN("MSR-GTK: ...")` markers.
 
+### 5. Settings & Build Options
+- **Preference ownership**: The disk caching options (`enable_cache`, `cache_dir`, `cache_catalog`, `cache_images`, `cache_audio`, `manual_sync`) are defined and defaulted (`msr_input_defaults`) in `msr_input.cpp` — the module that executes the caching. The UI modules must NOT redefine them; they keep only the view-mode keys (`enable_dedicated_window`, `simple_mode_art`, `default_view_mode`).
+- **Build switches**: `MSR_BUILD_QT_UI` and `MSR_BUILD_GTK_UI` (AUTO/ON/OFF) in `CMakeLists.txt` gate the two catalog UI modules. AUTO requires both the matching interface plugin (`qtui`/`gtkui`) in the Audacious plugin dir and the dev libraries; `ON` forces the module and hard-errors when deps are missing; the backend and input plugin always build.
+
 ---
 
 ## 📝 Coding Style & Commits

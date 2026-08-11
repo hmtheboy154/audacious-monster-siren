@@ -1,4 +1,5 @@
 build/
+build-*/
 *.so
 *.a
 *.o

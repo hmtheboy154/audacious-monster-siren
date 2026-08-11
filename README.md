@@ -34,7 +34,7 @@ A native dockable catalog window is provided for both Audacious interfaces, shar
   2. **Album List (`QListView`)**: Vertical card list rendering cover art thumbnails (64x64+), bold titles, and artist subtitles.
   3. **Grid / Icon View (`QListView::IconMode`)**: Multi-column grid layout displaying centered cover art cards (150x190) with word-wrapped titles beneath.
 - **Instant Search & One-Click Playback**: Real-time filtering (`QSortFilterProxyModel`) across Album Titles and Artistes. Double-clicking any album clears the active queue and starts playback instantly (`aud_drct_pl_open_list`).
-- **Persistent Disk Caching & Indexing**: Comprehensive offline storage engine customizable under **Audacious Preferences $\rightarrow$ Plugins $\rightarrow$ General $\rightarrow$ Monster Siren Catalog**:
+- **Persistent Disk Caching & Indexing**: Comprehensive offline storage engine for catalog data, cover art, audio tracks, and lyrics, customizable under **Audacious Preferences $\rightarrow$ Plugins $\rightarrow$ Input $\rightarrow$ Monster Siren Input Plugin** (the input plugin owns these settings because it performs the caching during playback):
   - **Directory Selection**: Configurable cache directory with a native Browse dialog (`~/.cache/audacious/monster-siren` by default) supporting automatic `file://` URI prefix sanitization.
   - **Granular Checkboxes**: Individual toggles for `Cache Catalog Data`, `Cache Album & Song Metadata`, `Cache Cover Art Images`, `Cache Audio Files (.mp3/.flac/.wav)`, and `Cache Lyrics (.lrc)`.
   - **Background Audio Caching**: When `Cache Audio Files` is enabled, tracks being played over the network automatically buffer and save to local disk on a background thread (`msr_fetch_and_cache_audio_background`), allowing transparent `file://` offline playback on subsequent listens.
@@ -42,7 +42,7 @@ A native dockable catalog window is provided for both Audacious interfaces, shar
 
 **GTK 3 (`monster-siren-gtk.so`, `PluginGLibOnly`)**:
 - **Native GTK3 Dockable Window**: The same catalog experience (Simple List / Album List / Grid views, instant search, refresh button, double-click playback) as a GTK3 General plugin dockable panel for `audacious -i gtk`, with asynchronous workers marshaled via `g_idle_add()`.
-- **Live View & Settings Sync**: The in-window view combo and the plugin settings apply immediately to the open window; the shared `[monster-siren]` defaults are registered in GTK mode too (`aud_config_set_defaults`), so both interfaces read and write identical options.
+- **Live View & Settings Sync**: The in-window view combo and the plugin settings apply immediately to the open window; disk caching options live under the input plugin's setting section, while the shared `[monster-siren]` view-mode defaults are registered per UI, so both interfaces read and write identical options.
 - **Simple List Thumbnails**: The `Show album art icons in Simple List mode` option renders 32px thumbnails in list rows, identical to Qt behavior.
 
 ---
@@ -91,6 +91,32 @@ cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 
 # Compile the plugin modules
 cmake --build build -j$(nproc)
+```
+
+#### UI Module Selection
+
+By default every UI module the installed Audacious actually supports is built. Two tri-state switches control the dockable catalog windows (`AUTO` / `ON` / `OFF`, default `AUTO`):
+
+| Option | Builds |
+|--------|--------|
+| `MSR_BUILD_QT_UI` | `monster-siren-ui` (Qt interface) |
+| `MSR_BUILD_GTK_UI` | `monster-siren-gtk` (GTK3 interface) |
+
+- **`AUTO`**: the module is built when the matching interface plugin (`qtui` / `gtkui`) ships in the installed Audacious plugin directory **and** the dev libraries are available; otherwise it is skipped with an explanatory configure message.
+- **`ON`**: force the module; configuration fails if the dev libraries are missing.
+- **`OFF`**: skip the module.
+
+The backend library and the input plugin are always built. Examples:
+
+```bash
+# Qt UI + input only (e.g. an Audacious without a GTK interface installed)
+cmake -B build -S . -DMSR_BUILD_GTK_UI=OFF
+
+# GTK3 UI + input only
+cmake -B build -S . -DMSR_BUILD_QT_UI=OFF -DMSR_BUILD_GTK_UI=ON -B build-gtk
+
+# Input plugin only
+cmake -B build -S . -DMSR_BUILD_QT_UI=OFF -DMSR_BUILD_GTK_UI=OFF
 ```
 
 ### Installing to Audacious

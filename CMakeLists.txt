@@ -29,6 +29,81 @@ find_package(Qt6 QUIET COMPONENTS Widgets)
 # Check for GTK3
 pkg_check_modules(GTK3 gtk+-3.0)
 
+# --- UI module selection --------------------------------------------------
+# The dockable catalog windows are General plugins that only make sense when
+# the installed Audacious actually provides the matching interface plugin in
+# its plugin directory. Each switch accepts:
+#
+#   AUTO - build when the interface plugin (qtui / gtkui) is shipped with the
+#          installed Audacious AND the dev libraries are available (default)
+#   ON   - force the module (hard error when the dev libraries are missing)
+#   OFF  - skip the module
+#
+# Whatever the combination, the backend library and the input plugin are
+# always built.
+set(MSR_BUILD_QT_UI "AUTO" CACHE STRING
+    "Qt catalog UI module: AUTO / ON / OFF")
+set_property(CACHE MSR_BUILD_QT_UI PROPERTY STRINGS AUTO ON OFF)
+
+set(MSR_BUILD_GTK_UI "AUTO" CACHE STRING
+    "GTK3 catalog UI module: AUTO / ON / OFF")
+set_property(CACHE MSR_BUILD_GTK_UI PROPERTY STRINGS AUTO ON OFF)
+
+# Returns TRUE if <name>.so or <name>.dll ships in the Audacious plugin dir.
+function(msr_interface_installed var name)
+    set(_found FALSE)
+    if(EXISTS "${AUDACIOUS_PLUGIN_DIR}/General/${name}.so")
+        set(_found TRUE)
+    elseif(EXISTS "${AUDACIOUS_PLUGIN_DIR}/General/${name}.dll")
+        set(_found TRUE)
+    endif()
+    set(${var} "${_found}" PARENT_SCOPE)
+endfunction()
+
+# Resolves one tri-state switch (AUTO/ON/OFF) into a boolean.
+function(msr_resolve_ui_switch option_var deps_ok interface_name resolved_var)
+    set(_value "${${option_var}}")
+    if(NOT _value STREQUAL "ON" AND NOT _value STREQUAL "OFF")
+        set(_value "AUTO")
+    endif()
+
+    if(_value STREQUAL "ON")
+        if(NOT deps_ok)
+            message(FATAL_ERROR "${option_var}=ON requires missing build dependencies "
+                "(interface '${interface_name}', see configure output above)")
+        endif()
+        set(_build TRUE)
+        message(STATUS "Monster Siren: ${option_var}=ON - forcing the '${interface_name}' module")
+    elseif(_value STREQUAL "OFF")
+        set(_build FALSE)
+        message(STATUS "Monster Siren: ${option_var}=OFF - skipping the '${interface_name}' module")
+    else()
+        msr_interface_installed(_iface "${interface_name}")
+        if(_iface AND deps_ok)
+            set(_build TRUE)
+            message(STATUS "Monster Siren: ${option_var}=AUTO - '${interface_name}' detected, building")
+        else()
+            set(_build FALSE)
+            if(NOT _iface)
+                message(STATUS "Monster Siren: ${option_var}=AUTO - interface '${interface_name}' "
+                    "not found in ${AUDACIOUS_PLUGIN_DIR}/General, skipping")
+            else()
+                message(STATUS "Monster Siren: ${option_var}=AUTO - deps missing, skipping")
+            endif()
+        endif()
+    endif()
+
+    set(${resolved_var} "${_build}" PARENT_SCOPE)
+endfunction()
+
+set(MSR_QT_DEPS_OK FALSE)
+if(Qt6Widgets_FOUND OR TARGET Qt6::Widgets)
+    set(MSR_QT_DEPS_OK TRUE)
+endif()
+
+msr_resolve_ui_switch(MSR_BUILD_QT_UI "${MSR_QT_DEPS_OK}" "qtui" MSR_BUILD_QT_UI_ENABLED)
+msr_resolve_ui_switch(MSR_BUILD_GTK_UI "${GTK3_FOUND}" "gtkui" MSR_BUILD_GTK_UI_ENABLED)
+
 # Common include directories and compiler flags
 add_compile_options(-Wall -Wextra -Wpedantic)
 add_compile_definitions(
@@ -68,7 +143,7 @@ install(TARGETS monster-siren-input
 )
 
 # 2. General/UI Plugin Module (Dockable Catalog Window & Settings for -i qt)
-if(Qt6Widgets_FOUND OR TARGET Qt6::Widgets)
+if(MSR_BUILD_QT_UI_ENABLED)
     message(STATUS "Qt6Widgets found, enabling monster-siren-ui target")
     add_library(monster-siren-ui MODULE src/msr_ui.cpp)
     target_include_directories(monster-siren-ui PRIVATE ${AUDACIOUS_INCLUDE_DIRS})
@@ -90,7 +165,7 @@ else()
 endif()
 
 # 3. GTK General/UI Plugin Module (Dockable Catalog Window for -i gtk)
-if(GTK3_FOUND)
+if(MSR_BUILD_GTK_UI_ENABLED)
     message(STATUS "GTK3 found (${GTK3_VERSION}), enabling monster-siren-gtk target")
     add_library(monster-siren-gtk MODULE src/msr_ui_gtk.cpp)
     target_include_directories(monster-siren-gtk PRIVATE ${AUDACIOUS_INCLUDE_DIRS} ${GTK3_INCLUDE_DIRS})
