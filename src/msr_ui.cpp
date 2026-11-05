@@ -27,6 +27,8 @@
 #include <QLabel>
 #include <QApplication>
 #include <QPointer>
+#include <atomic>
+#include <cstdint>
 #include <thread>
 
 #include "monster_siren.h"
@@ -386,7 +388,8 @@ private:
     QStandardItemModel * m_model = nullptr;
     CatalogFilterProxyModel * m_proxy = nullptr;
     QLabel * m_status_label = nullptr;
-    std::atomic<bool> m_images_loaded{false};
+    std::atomic<uint64_t> m_catalog_gen{0};
+    uint64_t m_images_loaded_gen = 0;
 
     void set_view_mode(int mode)
     {
@@ -396,7 +399,9 @@ private:
         else if (mode == 1) m_view_switch_btn->setText(QString::fromUtf8(_("View: Album List")));
         else m_view_switch_btn->setText(QString::fromUtf8(_("View: Grid")));
 
-        if ((mode != 0 || aud_get_bool("monster-siren", "simple_mode_art")) && !m_images_loaded && m_model->rowCount() > 0) {
+        uint64_t gen = m_catalog_gen.load();
+        if ((mode != 0 || aud_get_bool("monster-siren", "simple_mode_art")) &&
+            gen != 0 && m_images_loaded_gen != gen && m_model->rowCount() > 0) {
             start_async_image_loader();
         } else if (mode == 0 && m_tree) {
             m_tree->viewport()->update();
@@ -405,7 +410,7 @@ private:
 
     void populate_catalog(const std::vector<MsrAlbum> & albums)
     {
-        m_images_loaded = false;
+        m_images_loaded_gen = 0;
         for (const auto & album : albums) {
             auto * item0 = new QStandardItem(QString::fromUtf8((const char *)album.name));
             auto * item1 = new QStandardItem(QString::fromUtf8((const char *)album.artistes));
@@ -431,8 +436,11 @@ private:
 
     void start_async_image_loader()
     {
-        if (m_images_loaded.exchange(true))
+        uint64_t gen = m_catalog_gen.load();
+        if (gen == 0 || m_images_loaded_gen == gen || m_model->rowCount() <= 0)
             return;
+
+        m_images_loaded_gen = gen;
 
         // Collect cover URLs on the GUI thread to avoid concurrent model access
         struct CoverInfo { int row; QString url; };
@@ -447,12 +455,12 @@ private:
         }
 
         QPointer<MonsterSirenCatalogWidget> guard(this);
-        msr_run_background([guard, covers = std::move(covers)]() {
+        msr_run_background([guard, gen, covers = std::move(covers)]() {
             for (const auto & info : covers) {
-                if (!guard) return;
+                if (!guard || guard->m_catalog_gen.load() != gen) return;
 
                 Index<char> img_bytes = msr_fetch_image(String(info.url.toUtf8().constData()));
-                if (!guard || !img_bytes.len()) continue;
+                if (!guard || guard->m_catalog_gen.load() != gen || !img_bytes.len()) continue;
 
                 QByteArray qbytes(img_bytes.begin(), img_bytes.len());
                 // Decode and scale down completely inside the worker thread (QImage is non-GUI and 100% thread-safe)
@@ -463,8 +471,8 @@ private:
                 if (img.isNull()) continue;
 
                 int row = info.row;
-                QMetaObject::invokeMethod(guard.data(), [guard, row, img]() {
-                    if (!guard || !guard->m_model) return;
+                QMetaObject::invokeMethod(guard.data(), [guard, gen, row, img]() {
+                    if (!guard || !guard->m_model || guard->m_catalog_gen.load() != gen) return;
                     QStandardItem * item = guard->m_model->item(row, 0);
                     if (item)
                         item->setIcon(QIcon(QPixmap::fromImage(img)));
@@ -476,18 +484,20 @@ private:
 
     void refresh_catalog(bool force_network = false)
     {
+        uint64_t req_gen = ++m_catalog_gen;
+        m_images_loaded_gen = 0;
         m_model->removeRows(0, m_model->rowCount());
         m_status_label->setText(QString::fromUtf8(_("Loading Monster Siren catalog...")));
         if (m_refresh_btn)
             m_refresh_btn->setEnabled(false);
 
         QPointer<MonsterSirenCatalogWidget> guard(this);
-        msr_run_background([guard, force_network]() {
+        msr_run_background([guard, req_gen, force_network]() {
             std::vector<MsrAlbum> albums = msr_fetch_albums(force_network);
-            if (!guard)
+            if (!guard || guard->m_catalog_gen.load() != req_gen)
                 return;
-            QMetaObject::invokeMethod(guard.data(), [guard, albums = std::move(albums)]() {
-                if (!guard)
+            QMetaObject::invokeMethod(guard.data(), [guard, req_gen, albums = std::move(albums)]() {
+                if (!guard || guard->m_catalog_gen.load() != req_gen)
                     return;
                 guard->populate_catalog(albums);
             }, Qt::QueuedConnection);

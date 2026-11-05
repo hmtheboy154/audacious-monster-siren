@@ -18,6 +18,7 @@
 #include <vector>
 #include <string>
 #include <atomic>
+#include <cstdint>
 #include <memory>
 
 #define AUD_GLIB_INTEGRATION
@@ -46,6 +47,7 @@ struct GtkCatalogContext {
     GtkWidget * main_box = nullptr;
     GtkWidget * search_entry = nullptr;
     GtkWidget * view_combo = nullptr;
+    GtkWidget * refresh_btn = nullptr;
     gulong view_combo_handler = 0;
     GtkWidget * scroll = nullptr;
     GtkWidget * tree_view = nullptr;
@@ -56,7 +58,8 @@ struct GtkCatalogContext {
 
     std::string search_query;
     std::atomic<bool> destroyed{false};
-    std::atomic<bool> loading_images{false};
+    std::atomic<uint64_t> catalog_gen{0};
+    uint64_t images_loaded_gen = 0;
     int current_mode = -1;
     bool current_simple_mode_art = false;
 };
@@ -427,6 +430,7 @@ static void on_icon_item_activated(GtkIconView * icon_view, GtkTreePath * path, 
 
 struct ImageUpdateData {
     std::shared_ptr<GtkCatalogContext> ctx;
+    uint64_t gen;
     std::string cid;
     GdkPixbuf * pixbuf;
 };
@@ -441,7 +445,7 @@ static gboolean on_image_loaded_idle(gpointer user_data)
         return FALSE;
     }
 
-    if (!ctx->destroyed && ctx->store) {
+    if (!ctx->destroyed && ctx->store && ctx->catalog_gen.load() == update->gen) {
         GtkTreeIter iter;
         gboolean valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(update->ctx->store), &iter);
         while (valid) {
@@ -472,8 +476,16 @@ static gboolean on_image_loaded_idle(gpointer user_data)
 
 static void start_async_image_loader(std::shared_ptr<GtkCatalogContext> ctx)
 {
-    if (!ctx || ctx->loading_images.exchange(true))
+    if (!ctx || !ctx->store)
         return;
+
+    uint64_t gen = ctx->catalog_gen.load();
+    if (gen == 0 || ctx->images_loaded_gen == gen)
+        return;
+    if (gtk_tree_model_iter_n_children(GTK_TREE_MODEL(ctx->store), nullptr) <= 0)
+        return;
+
+    ctx->images_loaded_gen = gen;
 
     struct CoverInfo { std::string cid; std::string url; };
     std::vector<CoverInfo> covers;
@@ -491,12 +503,12 @@ static void start_async_image_loader(std::shared_ptr<GtkCatalogContext> ctx)
         valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(ctx->store), &iter);
     }
 
-    msr_run_background([ctx, covers = std::move(covers)]() {
+    msr_run_background([ctx, gen, covers = std::move(covers)]() {
         for (const auto & info : covers) {
-            if (ctx->destroyed) break;
+            if (ctx->destroyed || ctx->catalog_gen.load() != gen) break;
 
             Index<char> img_bytes = msr_fetch_image(String(info.url.c_str()));
-            if (ctx->destroyed || !img_bytes.len()) continue;
+            if (ctx->destroyed || ctx->catalog_gen.load() != gen || !img_bytes.len()) continue;
 
             GdkPixbufLoader * loader = gdk_pixbuf_loader_new();
             gdk_pixbuf_loader_write(loader, (const guchar *)img_bytes.begin(), img_bytes.len(), nullptr);
@@ -508,7 +520,7 @@ static void start_async_image_loader(std::shared_ptr<GtkCatalogContext> ctx)
                 g_object_unref(loader);
 
                 if (scaled) {
-                    ImageUpdateData * update = new ImageUpdateData{ctx, info.cid, scaled};
+                    ImageUpdateData * update = new ImageUpdateData{ctx, gen, info.cid, scaled};
                     g_idle_add(on_image_loaded_idle, update);
                 }
             } else {
@@ -520,6 +532,7 @@ static void start_async_image_loader(std::shared_ptr<GtkCatalogContext> ctx)
 
 struct CatalogPopulateData {
     std::shared_ptr<GtkCatalogContext> ctx;
+    uint64_t req_gen;
     std::vector<MsrAlbum> albums;
 };
 
@@ -527,7 +540,7 @@ static gboolean on_catalog_loaded_idle(gpointer user_data)
 {
     CatalogPopulateData * data = (CatalogPopulateData *)user_data;
     GtkCatalogContext * ctx = data->ctx.get();
-    if (!ctx->destroyed && ctx->store) {
+    if (!ctx->destroyed && ctx->store && ctx->catalog_gen.load() == data->req_gen) {
         gtk_list_store_clear(ctx->store);
 
         for (const auto & alb : data->albums) {
@@ -543,6 +556,10 @@ static gboolean on_catalog_loaded_idle(gpointer user_data)
                                -1);
         }
 
+        ctx->images_loaded_gen = 0;
+        if (ctx->refresh_btn)
+            gtk_widget_set_sensitive(ctx->refresh_btn, TRUE);
+
         if (ctx->status_label) {
             char status_buf[256];
             snprintf(status_buf, sizeof(status_buf),
@@ -551,7 +568,8 @@ static gboolean on_catalog_loaded_idle(gpointer user_data)
             gtk_label_set_text(GTK_LABEL(ctx->status_label), status_buf);
         }
 
-        int mode = aud_get_int("monster-siren", "default_view_mode");
+        int mode = (ctx->current_mode >= 0) ? ctx->current_mode
+                                            : aud_get_int("monster-siren", "default_view_mode");
         maybe_start_image_loader(data->ctx.get(), mode);
     }
 
@@ -564,15 +582,22 @@ static void fetch_and_populate_catalog(std::shared_ptr<GtkCatalogContext> ctx, b
     if (!ctx)
         return;
 
+    uint64_t req_gen = ++ctx->catalog_gen;
+    ctx->images_loaded_gen = 0;
+    if (ctx->store)
+        gtk_list_store_clear(ctx->store);
+    if (ctx->refresh_btn)
+        gtk_widget_set_sensitive(ctx->refresh_btn, FALSE);
+
     if (ctx->status_label)
         gtk_label_set_text(GTK_LABEL(ctx->status_label), _("Loading Monster Siren catalog..."));
 
-    msr_run_background([ctx, force_network]() {
+    msr_run_background([ctx, req_gen, force_network]() {
         std::vector<MsrAlbum> albums = msr_fetch_albums(force_network);
-        if (ctx->destroyed)
+        if (ctx->destroyed || ctx->catalog_gen.load() != req_gen)
             return;
 
-        CatalogPopulateData * data = new CatalogPopulateData{ctx, std::move(albums)};
+        CatalogPopulateData * data = new CatalogPopulateData{ctx, req_gen, std::move(albums)};
         g_idle_add(on_catalog_loaded_idle, data);
     });
 }
@@ -652,6 +677,7 @@ void * MsrGtkPlugin::get_gtk_widget()
     gtk_box_pack_start(GTK_BOX(top_box), c->view_combo, FALSE, FALSE, 0);
 
     GtkWidget * refresh_btn = gtk_button_new_from_icon_name("view-refresh-symbolic", GTK_ICON_SIZE_BUTTON);
+    c->refresh_btn = refresh_btn;
     gtk_widget_set_tooltip_text(refresh_btn, _("Force refresh catalog from network"));
     g_signal_connect(refresh_btn, "clicked", G_CALLBACK(on_refresh_clicked), nullptr);
     g_object_set_data_full(G_OBJECT(refresh_btn), "msr-ctx-shared",
