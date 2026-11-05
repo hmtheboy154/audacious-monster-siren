@@ -31,11 +31,13 @@
 #include <atomic>
 #include <cstdint>
 #include <algorithm>
+#include <memory>
 #include <vector>
 #include <thread>
 
 #include "monster_siren.h"
 #include <libaudcore/plugin.h>
+#include <libaudcore/plugins.h>
 #include <libaudcore/i18n.h>
 #include <libaudcore/preferences.h>
 #include <libaudcore/runtime.h>
@@ -101,6 +103,9 @@ public:
 
     void cleanup() override
     {
+        PluginHandle * self = aud_plugin_by_header(this);
+        if (self && aud_plugin_get_enabled(self))
+            msr_notify_app_shutdown();
         msr_wait_for_background_threads();
     }
 
@@ -400,12 +405,23 @@ public:
         refresh_catalog();
     }
 
+    ~MonsterSirenCatalogWidget() override
+    {
+        if (m_async)
+            m_async->destroyed.store(true, std::memory_order_release);
+    }
+
     void apply_preferences()
     {
         set_view_mode(aud_get_int("monster-siren", "default_view_mode"));
     }
 
 private:
+    struct AsyncCatalogState {
+        std::atomic<bool> destroyed{false};
+        std::atomic<uint64_t> catalog_gen{0};
+    };
+
     QLineEdit * m_search_entry = nullptr;
     QPushButton * m_view_switch_btn = nullptr;
     QPushButton * m_refresh_btn = nullptr;
@@ -416,7 +432,7 @@ private:
     QStandardItemModel * m_model = nullptr;
     CatalogFilterProxyModel * m_proxy = nullptr;
     QLabel * m_status_label = nullptr;
-    std::atomic<uint64_t> m_catalog_gen{0};
+    std::shared_ptr<AsyncCatalogState> m_async = std::make_shared<AsyncCatalogState>();
     uint64_t m_images_loaded_gen = 0;
 
     void set_view_mode(int mode)
@@ -427,7 +443,7 @@ private:
         else if (mode == 1) m_view_switch_btn->setText(QString::fromUtf8(_("View: Album List")));
         else m_view_switch_btn->setText(QString::fromUtf8(_("View: Grid")));
 
-        uint64_t gen = m_catalog_gen.load();
+        uint64_t gen = m_async->catalog_gen.load(std::memory_order_acquire);
         if ((mode != 0 || aud_get_bool("monster-siren", "simple_mode_art")) &&
             gen != 0 && m_images_loaded_gen != gen && m_model->rowCount() > 0) {
             start_async_image_loader();
@@ -453,20 +469,24 @@ private:
             m_model->appendRow({item0, item1});
         }
 
-        m_status_label->setText(QString::fromUtf8(_("Catalog loaded: %1 albums.\nDouble-click to clear queue & play."))
-                                    .arg(albums.size()));
+        if (albums.empty()) {
+            m_status_label->setText(QString::fromUtf8(_("Failed to load Monster Siren catalog.\nClick Refresh to retry.")));
+        } else {
+            m_status_label->setText(QString::fromUtf8(_("Catalog loaded: %1 albums.\nDouble-click to clear queue & play."))
+                                        .arg(albums.size()));
+        }
         if (m_refresh_btn)
             m_refresh_btn->setEnabled(true);
 
         int mode = m_stack->currentIndex();
-        if (mode != 0 || aud_get_bool("monster-siren", "simple_mode_art")) {
+        if (!albums.empty() && (mode != 0 || aud_get_bool("monster-siren", "simple_mode_art"))) {
             start_async_image_loader();
         }
     }
 
     void start_async_image_loader()
     {
-        uint64_t gen = m_catalog_gen.load();
+        uint64_t gen = m_async->catalog_gen.load(std::memory_order_acquire);
         if (gen == 0 || m_images_loaded_gen == gen || m_model->rowCount() <= 0)
             return;
 
@@ -484,13 +504,18 @@ private:
                 covers.push_back({i, cover_url});
         }
 
+        auto async = m_async;
         QPointer<MonsterSirenCatalogWidget> guard(this);
-        msr_run_background([guard, gen, covers = std::move(covers)]() {
+        msr_run_background([guard, async, gen, covers = std::move(covers)]() {
+            auto cancel = [async, gen]() {
+                return async->destroyed.load(std::memory_order_relaxed) ||
+                       async->catalog_gen.load(std::memory_order_relaxed) != gen;
+            };
             for (const auto & info : covers) {
-                if (!guard || guard->m_catalog_gen.load() != gen) return;
+                if (cancel()) return;
 
-                Index<char> img_bytes = msr_fetch_image(String(info.url.toUtf8().constData()));
-                if (!guard || guard->m_catalog_gen.load() != gen || !img_bytes.len()) continue;
+                Index<char> img_bytes = msr_fetch_image(String(info.url.toUtf8().constData()), cancel);
+                if (cancel() || !img_bytes.len()) continue;
 
                 QByteArray qbytes(img_bytes.begin(), img_bytes.len());
                 // Decode and scale down completely inside the worker thread (QImage is non-GUI and 100% thread-safe)
@@ -501,12 +526,16 @@ private:
                 if (img.isNull()) continue;
 
                 int row = info.row;
-                QMetaObject::invokeMethod(guard.data(), [guard, gen, row, img]() {
-                    if (!guard || !guard->m_model || guard->m_catalog_gen.load() != gen) return;
-                    QStandardItem * item = guard->m_model->item(row, 0);
-                    if (item)
-                        item->setIcon(QIcon(QPixmap::fromImage(img)));
-                }, Qt::QueuedConnection);
+                if (auto * app = QCoreApplication::instance()) {
+                    QMetaObject::invokeMethod(app, [guard, gen, row, img]() {
+                        if (!guard || !guard->m_model ||
+                            guard->m_async->catalog_gen.load(std::memory_order_relaxed) != gen)
+                            return;
+                        QStandardItem * item = guard->m_model->item(row, 0);
+                        if (item)
+                            item->setIcon(QIcon(QPixmap::fromImage(img)));
+                    }, Qt::QueuedConnection);
+                }
             }
         });
     }
@@ -514,23 +543,30 @@ private:
 
     void refresh_catalog(bool force_network = false)
     {
-        uint64_t req_gen = ++m_catalog_gen;
+        uint64_t req_gen = m_async->catalog_gen.fetch_add(1, std::memory_order_acq_rel) + 1;
         m_images_loaded_gen = 0;
         m_model->removeRows(0, m_model->rowCount());
         m_status_label->setText(QString::fromUtf8(_("Loading Monster Siren catalog...")));
         if (m_refresh_btn)
             m_refresh_btn->setEnabled(false);
 
+        auto async = m_async;
         QPointer<MonsterSirenCatalogWidget> guard(this);
-        msr_run_background([guard, req_gen, force_network]() {
-            std::vector<MsrAlbum> albums = msr_fetch_albums(force_network);
-            if (!guard || guard->m_catalog_gen.load() != req_gen)
+        msr_run_background([guard, async, req_gen, force_network]() {
+            auto cancel = [async, req_gen]() {
+                return async->destroyed.load(std::memory_order_relaxed) ||
+                       async->catalog_gen.load(std::memory_order_relaxed) != req_gen;
+            };
+            std::vector<MsrAlbum> albums = msr_fetch_albums(force_network, cancel);
+            if (cancel())
                 return;
-            QMetaObject::invokeMethod(guard.data(), [guard, req_gen, albums = std::move(albums)]() {
-                if (!guard || guard->m_catalog_gen.load() != req_gen)
-                    return;
-                guard->populate_catalog(albums);
-            }, Qt::QueuedConnection);
+            if (auto * app = QCoreApplication::instance()) {
+                QMetaObject::invokeMethod(app, [guard, req_gen, albums = std::move(albums)]() {
+                    if (!guard || guard->m_async->catalog_gen.load(std::memory_order_relaxed) != req_gen)
+                        return;
+                    guard->populate_catalog(albums);
+                }, Qt::QueuedConnection);
+            }
         });
     }
 

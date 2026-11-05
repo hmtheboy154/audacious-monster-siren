@@ -14,6 +14,7 @@ set(CMAKE_AUTOMOC ON)
 # Find PkgConfig and dependencies
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(AUDACIOUS REQUIRED audacious>=4.6.1)
+pkg_check_modules(CURL REQUIRED libcurl)
 pkg_get_variable(AUDACIOUS_PLUGIN_DIR audacious plugin_dir)
 
 if(NOT AUDACIOUS_PLUGIN_DIR)
@@ -119,9 +120,11 @@ add_library(msr_backend STATIC
 target_include_directories(msr_backend PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     ${AUDACIOUS_INCLUDE_DIRS}
+    ${CURL_INCLUDE_DIRS}
 )
 target_link_libraries(msr_backend PUBLIC
     ${AUDACIOUS_LIBRARIES}
+    ${CURL_LIBRARIES}
     Qt6::Core
 )
 set_target_properties(msr_backend PROPERTIES POSITION_INDEPENDENT_CODE ON)

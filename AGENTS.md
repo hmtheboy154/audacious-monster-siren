@@ -10,7 +10,7 @@ The suite is built using CMake and is strictly divided into decoupled modules to
 
 1. **`msr_backend` (`src/monster_siren.cpp` & `.h`)**
    - **Role**: A UI-agnostic C++ static library. Handles API fetching, URL routing (`msr_parse_url`), JSON deserialization (`Qt6::Core QJsonDocument`), and offline disk caching.
-   - **Networking Rule**: NEVER use `QNetworkAccessManager` or `QEventLoop`. All network I/O must use Audacious's native Virtual File System (`VFSFile` / `<libaudcore/vfs.h>`) so the backend runs natively in pure GTK environments without a Qt event loop (`qApp`).
+   - **Networking Rule**: NEVER use `QNetworkAccessManager` or `QEventLoop` (no Qt event loop exists in pure GTK mode), and avoid Audacious's `VFSFile` (`neon.so`) for backend API/image/lyrics/probe HTTP transfers (`libneon` clears `O_NONBLOCK` and can block indefinitely inside `SSL_peek_ex`/`SSL_read` on stalled mid-record TLS connections). Use `libcurl`'s non-blocking `CURLM` poll loop in `msr_backend` so every transfer has strict stall timeouts and `<= 100 ms` cancellation on catalog reload or process exit; reserve `VFSFile` for local cache URIs and handing stream playback off to Audacious's audio decoders.
 
 2. **`monster-siren-input.so` (`src/msr_input.cpp`)**
    - **Role**: An Audacious `InputPlugin`. It registers the `msr://` URI scheme, expands album tracklists, probes remote track lengths (`probe_remote_length`), and routes streams into Audacious's audio pipeline.
@@ -34,7 +34,7 @@ Audacious plugins share the main player event loop. **Never block the GUI thread
 - **UI Updates**: Always marshal data back to the GUI thread before touching UI components:
   - **Qt**: Use `QMetaObject::invokeMethod(..., Qt::QueuedConnection)`.
   - **GTK**: Use `g_idle_add()`.
-- **Exit & Module Unload**: Audacious `dlclose`s plugin modules during teardown while workers may still be running. Launch every long-lived worker with `msr_run_background()` so the registry can join it in `msr_wait_for_background_threads()`, which every plugin's `cleanup()` must call. Keep fetches abortable: `msr_fetch_bytes()` reads in bounded chunks and checks the shutdown flag between reads so a slow CDN never delays exit.
+- **Exit & Module Unload**: Audacious `dlclose`s plugin modules during teardown while workers may still be running. Launch every long-lived worker with `msr_run_background()` so the registry can join it in `msr_wait_for_background_threads()`, which every plugin's `cleanup()` must call. Keep fetches abortable via `libcurl` `CURLM` 100 ms polling (`g_shutting_down` + `MsrCancelFn`) and broadcast `msr_notify_app_shutdown()` from enabled General plugins at exit so playlist scanner/adder calls into `monster-siren-input.so` also abort before `stop_plugins_one()`.
 - **Never** arm shutdown or abort logic from the `"playback stop"` hook: it fires on every stop and track change, not only at exit, and aborted network reads mid-playback produced "could not be decoded" errors for uncached albums.
 - **Global State**: Protect global memory caches (`g_cached_albums`, `g_cached_images`) using `std::mutex g_cache_mutex;`.
 
@@ -46,6 +46,7 @@ We use a custom virtual filesystem scheme:
 
 ### 3. Dependencies
 - **libaudcore / libaudgui**: Core Audacious APIs. Use `String`, `Index<T>`, `VFSFile`, `Tuple`, and `PreferencesWidget`.
+- **libcurl**: UI-agnostic, non-blocking HTTP/HTTPS client (`CURLM` poll loop) for API metadata, cover art, lyrics, header byte-range probes, and background track caching.
 - **Qt6::Core**: Used strictly for headless JSON parsing (`QJsonObject`), `QString`, and `QCryptographicHash`. (No `Qt6::Network`).
 - **GTK 3**: Used exclusively in `msr_ui_gtk.cpp` (`GtkTreeView`, `GtkIconView`, `GdkPixbuf`).
 

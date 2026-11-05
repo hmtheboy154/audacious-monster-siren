@@ -14,6 +14,9 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <cstdint>
+
+using MsrCancelFn = std::function<bool()>;
 
 enum class MsrUrlType {
     Unknown = 0,
@@ -57,11 +60,17 @@ struct MsrSongDetail {
 MsrUrlParsed msr_parse_url(const char * url);
 
 // API calls (cached where appropriate)
-std::vector<MsrAlbum> msr_fetch_albums(bool force_network = false);
+std::vector<MsrAlbum> msr_fetch_albums(bool force_network = false,
+                                       const MsrCancelFn & should_cancel = nullptr);
 MsrAlbum msr_fetch_album_detail(const String & cid);
 MsrSongDetail msr_fetch_song_detail(const String & cid);
-Index<char> msr_fetch_image(const String & url);
+Index<char> msr_fetch_image(const String & url,
+                            const MsrCancelFn & should_cancel = nullptr);
 String msr_fetch_lyrics(const String & url);
+
+// Bounded HTTP byte-range fetch for stream header duration probing
+bool msr_http_fetch_range(const char * url, int64_t offset, int64_t max_bytes,
+                          Index<char> & out_data, int64_t & out_total_size);
 
 // Disk caching and offline synchronization API
 String msr_get_cache_dir();
@@ -98,6 +107,8 @@ void msr_invalidate_catalog_cache();
 //  - msr_wait_for_background_threads() sets the shutdown flag (aborting
 //    in-flight fetches at the next bounded read) and joins all threads.
 void msr_reset_shutdown();
+bool msr_is_shutting_down();
+void msr_notify_app_shutdown();
 void msr_run_background(std::function<void()> task);
 void msr_wait_for_background_threads();
 

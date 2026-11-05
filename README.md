@@ -5,6 +5,7 @@ A flagship, feature-rich Audacious plugin suite that fetches, catalogs, caches, 
 ## Requirements
 
 - **Audacious 4.6.1 or above** (`libaudcore` headers and libraries)
+- **libcurl** (`libcurl` headers and libraries for non-blocking HTTPS transfers)
 - **Qt 6** (`Core` for JSON/cache utilities; optional `Widgets` for the Qt catalog UI)
 - **GTK 3** (optional `libgtk-3` dev headers for the GTK3 catalog UI)
 - **CMake 3.16+** and a C++20 compatible compiler

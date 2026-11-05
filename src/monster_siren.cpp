@@ -3,19 +3,18 @@
  *
  * Implements communication with the official Hypergryph Monster Siren API
  * (`https://monster-siren.hypergryph.com/api/...`). Provides:
- * 1. Resilient HTTP/HTTPS request execution over Audacious's VFS transport with automatic retry + backoff.
+ * 1. Non-blocking, interruptible HTTP/HTTPS transfers via libcurl with bounded timeouts and retry + backoff.
  * 2. JSON deserialization of albums, songs, and artists.
  * 3. Thread-safe in-memory caching (`std::mutex`) for album details, song metadata, and cover art images.
  * 4. URL parsing (`msr_parse_url`) converting custom `msr://` and web URLs into structured routing entities.
- * 5. Background thread registry so plugins can join their workers at shutdown.
+ * 5. Background thread registry so plugins can abort and join their workers promptly at shutdown.
  */
 
-#include <libaudcore/vfs.h>
+#include <curl/curl.h>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QUrl>
-#include <QThread>
 #include <QFile>
 #include <QFileInfo>
 #include <QSaveFile>
@@ -27,7 +26,9 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <chrono>
 #include <memory>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 
@@ -60,6 +61,14 @@ static std::mutex g_thread_mutex;
 static std::vector<WorkerEntry> g_threads;
 static std::atomic<bool> g_shutting_down{false};
 static bool g_hooks_registered = false;
+static std::once_flag g_curl_init_flag;
+
+static void msr_ensure_curl_init()
+{
+    std::call_once(g_curl_init_flag, []() {
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+    });
+}
 
 static void on_cache_clear_hook(void *, void *)
 {
@@ -75,14 +84,32 @@ static void on_song_invalidate_hook(void * data, void *)
     g_cached_song_details.erase(std::string(cid));
 }
 
+static void on_begin_shutdown_hook(void *, void *)
+{
+    g_shutting_down.store(true, std::memory_order_release);
+}
+
 void msr_reset_shutdown()
 {
-    g_shutting_down = false;
+    msr_ensure_curl_init();
+    g_shutting_down.store(false, std::memory_order_release);
     if (!g_hooks_registered) {
         hook_associate("msr cache clear", on_cache_clear_hook, nullptr);
         hook_associate("msr song invalidate", on_song_invalidate_hook, nullptr);
+        hook_associate("msr begin shutdown", on_begin_shutdown_hook, nullptr);
         g_hooks_registered = true;
     }
+}
+
+bool msr_is_shutting_down()
+{
+    return g_shutting_down.load(std::memory_order_acquire);
+}
+
+void msr_notify_app_shutdown()
+{
+    g_shutting_down.store(true, std::memory_order_release);
+    hook_call("msr begin shutdown", nullptr);
 }
 
 void msr_run_background(std::function<void()> task)
@@ -122,7 +149,7 @@ void msr_run_background(std::function<void()> task)
 
 void msr_begin_shutdown()
 {
-    g_shutting_down = true;
+    g_shutting_down.store(true, std::memory_order_release);
 }
 
 void msr_wait_for_background_threads()
@@ -142,57 +169,420 @@ void msr_wait_for_background_threads()
     if (g_hooks_registered) {
         hook_dissociate("msr cache clear", on_cache_clear_hook);
         hook_dissociate("msr song invalidate", on_song_invalidate_hook);
+        hook_dissociate("msr begin shutdown", on_begin_shutdown_hook);
         g_hooks_registered = false;
     }
 }
 
-/**
- * Executes a GET request over Audacious's VFS transport and returns raw
- * response bytes. Features a 3-attempt retry loop with linear backoff to
- * gracefully handle socket/SSL handshakes or temporary network contention
- * (especially during concurrent Audacious startup). The body is read in
- * bounded chunks so shutdown can abort the transfer promptly instead of
- * blocking process exit on a full-track (or hung) download.
- */
-static QByteArray msr_fetch_bytes(const QString & url)
+static bool msr_should_abort(const MsrCancelFn & should_cancel)
 {
-    String aud_url(url.toUtf8().constData());
-    for (int attempt = 0; attempt < 3; attempt++) {
-        if (g_shutting_down)
-            return QByteArray();
+    return g_shutting_down.load(std::memory_order_relaxed) ||
+           (should_cancel && should_cancel());
+}
 
-        VFSFile file(aud_url, "r");
-        if (file) {
-            int64_t expected = file.fsize();
-            QByteArray out;
-            if (expected > 0 && expected <= 256 * 1024 * 1024)
-                out.reserve((int)expected);
-            char buf[65536];
-            while (!g_shutting_down) {
-                int64_t n = file.fread(buf, 1, sizeof(buf));
-                if (n <= 0)
-                    break;
-                out.append(buf, (int)n);
+static void msr_sleep_interruptible(int total_ms, const MsrCancelFn & should_cancel)
+{
+    int elapsed = 0;
+    while (elapsed < total_ms && !msr_should_abort(should_cancel)) {
+        int step = std::min(25, total_ms - elapsed);
+        std::this_thread::sleep_for(std::chrono::milliseconds(step));
+        elapsed += step;
+    }
+}
+
+static bool msr_ascii_istarts_with(const char * s, size_t len, const char * prefix)
+{
+    size_t plen = strlen(prefix);
+    if (len < plen)
+        return false;
+    for (size_t i = 0; i < plen; i++) {
+        unsigned char a = (unsigned char)s[i];
+        unsigned char b = (unsigned char)prefix[i];
+        if (a >= 'A' && a <= 'Z') a = (unsigned char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (unsigned char)(b - 'A' + 'a');
+        if (a != b)
+            return false;
+    }
+    return true;
+}
+
+static bool msr_is_nonretryable_http_status(long status)
+{
+    return status >= 400 && status < 500 && status != 408 && status != 429;
+}
+
+static void msr_configure_curl_handle(CURL * easy, const char * url,
+                                      long connect_timeout_ms, bool allow_compressed)
+{
+    curl_easy_setopt(easy, CURLOPT_URL, url);
+    curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(easy, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT_MS, connect_timeout_ms);
+    curl_easy_setopt(easy, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(easy, CURLOPT_LOW_SPEED_TIME, 12L);
+    curl_easy_setopt(easy, CURLOPT_USERAGENT, "Audacious-MonsterSiren/1.0");
+    if (allow_compressed)
+        curl_easy_setopt(easy, CURLOPT_ACCEPT_ENCODING, "");
+
+    if (aud_get_bool("use_proxy")) {
+        String proxy_host = aud_get_str("proxy_host");
+        int proxy_port = aud_get_int("proxy_port");
+        bool socks_proxy = aud_get_bool("socks_proxy");
+        int socks_type = aud_get_int("socks_type");
+
+        if (proxy_host && proxy_host[0]) {
+            curl_easy_setopt(easy, CURLOPT_PROXY, (const char *)proxy_host);
+            if (proxy_port > 0)
+                curl_easy_setopt(easy, CURLOPT_PROXYPORT, (long)proxy_port);
+            curl_easy_setopt(easy, CURLOPT_PROXYTYPE,
+                             socks_proxy
+                                 ? (socks_type == 0 ? (long)CURLPROXY_SOCKS4A
+                                                    : (long)CURLPROXY_SOCKS5_HOSTNAME)
+                                 : (long)CURLPROXY_HTTP);
+
+            if (aud_get_bool("use_proxy_auth")) {
+                String proxy_user = aud_get_str("proxy_user");
+                String proxy_pass = aud_get_str("proxy_pass");
+                curl_easy_setopt(easy, CURLOPT_PROXYUSERNAME,
+                                 proxy_user ? (const char *)proxy_user : "");
+                curl_easy_setopt(easy, CURLOPT_PROXYPASSWORD,
+                                 proxy_pass ? (const char *)proxy_pass : "");
             }
-            if (g_shutting_down)
-                return QByteArray();
-            bool complete = (expected > 0) ? (out.size() >= expected) : file.feof();
-            if (complete && out.size() > 0)
-                return out;
+        }
+    }
+}
+
+struct CurlTransferOutcome {
+    CURLcode curl_code = CURLE_FAILED_INIT;
+    long http_status = 0;
+    bool cancelled = false;
+    bool timed_out = false;
+};
+
+/**
+ * Drives a single CURL easy handle on a dedicated CURLM non-blocking poll loop
+ * (100 ms max tick) rather than Audacious's Neon VFS transport. This avoids
+ * libneon's blocking SSL_peek_ex/SSL_read hang on stalled mid-record TLS
+ * streams and guarantees <= 100 ms cancellation on app exit or catalog reload.
+ */
+static CurlTransferOutcome msr_perform_curl_interruptible(CURL * easy,
+                                                          std::atomic<int64_t> & progress_bytes,
+                                                          int stall_timeout_ms,
+                                                          int max_total_ms,
+                                                          const MsrCancelFn & should_cancel)
+{
+    CurlTransferOutcome outcome;
+    CURLM * multi = curl_multi_init();
+    if (!multi)
+        return outcome;
+
+    if (curl_multi_add_handle(multi, easy) != CURLM_OK) {
+        curl_multi_cleanup(multi);
+        return outcome;
+    }
+
+    auto start_tp = std::chrono::steady_clock::now();
+    auto last_progress_tp = start_tp;
+    int64_t last_bytes = progress_bytes.load(std::memory_order_relaxed);
+    int still_running = 0;
+
+    while (true) {
+        if (msr_should_abort(should_cancel)) {
+            outcome.cancelled = true;
+            break;
         }
 
-        if (attempt < 2 && !g_shutting_down)
-            QThread::msleep(150 * (attempt + 1));
+        CURLMcode mc = curl_multi_perform(multi, &still_running);
+        if (mc != CURLM_OK) {
+            outcome.curl_code = CURLE_RECV_ERROR;
+            break;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        int64_t cur_bytes = progress_bytes.load(std::memory_order_relaxed);
+        if (cur_bytes != last_bytes) {
+            last_bytes = cur_bytes;
+            last_progress_tp = now;
+        }
+
+        if (!still_running)
+            break;
+
+        if (stall_timeout_ms > 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_progress_tp).count() >= stall_timeout_ms)
+        {
+            outcome.timed_out = true;
+            outcome.curl_code = CURLE_OPERATION_TIMEDOUT;
+            break;
+        }
+
+        if (max_total_ms > 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - start_tp).count() >= max_total_ms)
+        {
+            outcome.timed_out = true;
+            outcome.curl_code = CURLE_OPERATION_TIMEDOUT;
+            break;
+        }
+
+        mc = curl_multi_poll(multi, nullptr, 0, 100, nullptr);
+        if (mc != CURLM_OK) {
+            outcome.curl_code = CURLE_RECV_ERROR;
+            break;
+        }
+    }
+
+    if (!outcome.cancelled && !outcome.timed_out) {
+        int msgs_left = 0;
+        while (CURLMsg * msg = curl_multi_info_read(multi, &msgs_left)) {
+            if (msg->msg == CURLMSG_DONE)
+                outcome.curl_code = msg->data.result;
+        }
+        curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &outcome.http_status);
+    }
+
+    curl_multi_remove_handle(multi, easy);
+    curl_multi_cleanup(multi);
+    return outcome;
+}
+
+struct CurlBufferSink {
+    QByteArray * buf = nullptr;
+    std::atomic<int64_t> * progress = nullptr;
+    int64_t max_bytes = 256LL * 1024 * 1024;
+    bool overflow = false;
+};
+
+static size_t msr_curl_progress_header_cb(char * ptr, size_t size, size_t nmemb, void * userdata)
+{
+    (void)ptr;
+    size_t total = size * nmemb;
+    auto * progress = static_cast<std::atomic<int64_t> *>(userdata);
+    if (progress && total > 0)
+        progress->fetch_add((int64_t)total, std::memory_order_relaxed);
+    return total;
+}
+
+static size_t msr_curl_buffer_write_cb(char * ptr, size_t size, size_t nmemb, void * userdata)
+{
+    size_t total = size * nmemb;
+    auto * sink = static_cast<CurlBufferSink *>(userdata);
+    if (!sink || !sink->buf)
+        return 0;
+    if ((int64_t)sink->buf->size() + (int64_t)total > sink->max_bytes) {
+        sink->overflow = true;
+        return 0;
+    }
+    if (total > 0) {
+        sink->buf->append(ptr, (qsizetype)total);
+        if (sink->progress)
+            sink->progress->fetch_add((int64_t)total, std::memory_order_relaxed);
+    }
+    return total;
+}
+
+static QByteArray msr_fetch_bytes(const QString & url,
+                                  int max_total_ms = 0,
+                                  const MsrCancelFn & should_cancel = nullptr)
+{
+    msr_ensure_curl_init();
+    QByteArray url_utf8 = url.toUtf8();
+    if (url_utf8.isEmpty())
+        return QByteArray();
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (msr_should_abort(should_cancel))
+            return QByteArray();
+
+        CURL * easy = curl_easy_init();
+        if (!easy)
+            return QByteArray();
+
+        QByteArray out;
+        std::atomic<int64_t> progress{0};
+        CurlBufferSink sink{&out, &progress, 256LL * 1024 * 1024, false};
+
+        msr_configure_curl_handle(easy, url_utf8.constData(),
+                                  max_total_ms > 0 ? 8000L : 10000L, true);
+        curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, msr_curl_progress_header_cb);
+        curl_easy_setopt(easy, CURLOPT_HEADERDATA, &progress);
+        curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, msr_curl_buffer_write_cb);
+        curl_easy_setopt(easy, CURLOPT_WRITEDATA, &sink);
+
+        int stall_ms = (max_total_ms > 0) ? 10000 : 12000;
+        CurlTransferOutcome outcome = msr_perform_curl_interruptible(
+            easy, progress, stall_ms, max_total_ms, should_cancel);
+        curl_easy_cleanup(easy);
+
+        if (outcome.cancelled)
+            return QByteArray();
+
+        if (!sink.overflow && !outcome.timed_out &&
+            outcome.curl_code == CURLE_OK &&
+            outcome.http_status >= 200 && outcome.http_status < 300 &&
+            !out.isEmpty())
+        {
+            return out;
+        }
+
+        if (outcome.timed_out) {
+            AUDWARN("MSR: HTTP transfer timed out (attempt %d/3) for %s\n",
+                    attempt + 1, url_utf8.constData());
+        } else if (outcome.curl_code != CURLE_OK) {
+            AUDWARN("MSR: HTTP transfer error '%s' (attempt %d/3) for %s\n",
+                    curl_easy_strerror(outcome.curl_code), attempt + 1, url_utf8.constData());
+        } else if (outcome.http_status > 0) {
+            AUDWARN("MSR: HTTP status %ld (attempt %d/3) for %s\n",
+                    outcome.http_status, attempt + 1, url_utf8.constData());
+        }
+
+        if (msr_is_nonretryable_http_status(outcome.http_status))
+            break;
+
+        if (attempt < 2)
+            msr_sleep_interruptible(150 * (attempt + 1), should_cancel);
     }
     return QByteArray();
 }
 
-static QJsonDocument msr_fetch_json(const QString & url)
+static QJsonDocument msr_fetch_json(const QString & url,
+                                    const MsrCancelFn & should_cancel = nullptr)
 {
-    QByteArray bytes = msr_fetch_bytes(url);
+    QByteArray bytes = msr_fetch_bytes(url, 25000, should_cancel);
     if (bytes.isEmpty())
         return QJsonDocument();
     return QJsonDocument::fromJson(bytes);
+}
+
+struct CurlRangeSink {
+    Index<char> * data = nullptr;
+    std::atomic<int64_t> * progress = nullptr;
+    int64_t max_bytes = 0;
+    int64_t content_range_total = -1;
+    bool reached_limit = false;
+};
+
+static size_t msr_curl_range_header_cb(char * ptr, size_t size, size_t nmemb, void * userdata)
+{
+    size_t total = size * nmemb;
+    auto * sink = static_cast<CurlRangeSink *>(userdata);
+    if (!sink)
+        return total;
+    if (sink->progress && total > 0)
+        sink->progress->fetch_add((int64_t)total, std::memory_order_relaxed);
+
+    if (msr_ascii_istarts_with(ptr, total, "HTTP/")) {
+        sink->content_range_total = -1;
+    } else if (msr_ascii_istarts_with(ptr, total, "Content-Range:")) {
+        std::string line(ptr, total);
+        size_t slash = line.find('/');
+        if (slash != std::string::npos && slash + 1 < line.size()) {
+            const char * num = line.c_str() + slash + 1;
+            while (*num == ' ' || *num == '\t')
+                num++;
+            if (*num >= '0' && *num <= '9') {
+                char * endp = nullptr;
+                long long parsed = std::strtoll(num, &endp, 10);
+                if (parsed > 0)
+                    sink->content_range_total = (int64_t)parsed;
+            }
+        }
+    }
+    return total;
+}
+
+static size_t msr_curl_range_write_cb(char * ptr, size_t size, size_t nmemb, void * userdata)
+{
+    size_t total = size * nmemb;
+    auto * sink = static_cast<CurlRangeSink *>(userdata);
+    if (!sink || !sink->data)
+        return 0;
+
+    int64_t cur = sink->data->len();
+    int64_t remain = sink->max_bytes - cur;
+    if (remain <= 0) {
+        sink->reached_limit = true;
+        return 0;
+    }
+
+    int64_t to_copy = std::min((int64_t)total, remain);
+    if (to_copy > 0) {
+        sink->data->insert(ptr, -1, (int)to_copy);
+        if (sink->progress)
+            sink->progress->fetch_add(to_copy, std::memory_order_relaxed);
+    }
+
+    if ((int64_t)total > to_copy) {
+        sink->reached_limit = true;
+        return 0;
+    }
+    return total;
+}
+
+bool msr_http_fetch_range(const char * url, int64_t offset, int64_t max_bytes,
+                          Index<char> & out_data, int64_t & out_total_size)
+{
+    out_data.clear();
+    out_total_size = -1;
+    if (!url || !url[0] || offset < 0 || max_bytes <= 0 || msr_is_shutting_down())
+        return false;
+
+    msr_ensure_curl_init();
+    char range_spec[64];
+    std::snprintf(range_spec, sizeof(range_spec), "%lld-%lld",
+                  (long long)offset, (long long)(offset + max_bytes - 1));
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (msr_is_shutting_down())
+            return false;
+
+        CURL * easy = curl_easy_init();
+        if (!easy)
+            return false;
+
+        out_data.clear();
+        std::atomic<int64_t> progress{0};
+        CurlRangeSink sink{&out_data, &progress, max_bytes, -1, false};
+
+        msr_configure_curl_handle(easy, url, 8000L, false);
+        curl_easy_setopt(easy, CURLOPT_RANGE, range_spec);
+        curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, msr_curl_range_header_cb);
+        curl_easy_setopt(easy, CURLOPT_HEADERDATA, &sink);
+        curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, msr_curl_range_write_cb);
+        curl_easy_setopt(easy, CURLOPT_WRITEDATA, &sink);
+
+        CurlTransferOutcome outcome = msr_perform_curl_interruptible(
+            easy, progress, 10000, 20000, nullptr);
+
+        curl_off_t dl_content_len = -1;
+        curl_easy_getinfo(easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &dl_content_len);
+        curl_easy_cleanup(easy);
+
+        if (outcome.cancelled)
+            return false;
+
+        bool transfer_ok = (outcome.curl_code == CURLE_OK) ||
+                           (sink.reached_limit && outcome.curl_code == CURLE_WRITE_ERROR);
+        bool status_ok = (outcome.http_status == 206) ||
+                         (outcome.http_status == 200 && offset == 0);
+
+        if (!outcome.timed_out && transfer_ok && status_ok && out_data.len() > 0) {
+            if (sink.content_range_total > 0)
+                out_total_size = sink.content_range_total;
+            else if (outcome.http_status == 200 && dl_content_len > 0)
+                out_total_size = (int64_t)dl_content_len;
+            return true;
+        }
+
+        if (msr_is_nonretryable_http_status(outcome.http_status))
+            break;
+
+        if (attempt < 1)
+            msr_sleep_interruptible(150, nullptr);
+    }
+
+    out_data.clear();
+    return false;
 }
 
 MsrUrlParsed msr_parse_url(const char * url)
@@ -524,6 +914,31 @@ void msr_save_lyrics_to_cache(const String & cid_or_url, const String & lyrics_t
 static std::mutex g_inflight_audio_mutex;
 static std::set<std::string> g_inflight_audio_cids;
 
+struct CurlFileSink {
+    QSaveFile * file = nullptr;
+    std::atomic<int64_t> * progress = nullptr;
+    int64_t written = 0;
+    bool write_ok = true;
+};
+
+static size_t msr_curl_file_write_cb(char * ptr, size_t size, size_t nmemb, void * userdata)
+{
+    size_t total = size * nmemb;
+    auto * sink = static_cast<CurlFileSink *>(userdata);
+    if (!sink || !sink->file)
+        return 0;
+    if (total == 0)
+        return 0;
+    if (sink->file->write(ptr, (qint64)total) != (qint64)total) {
+        sink->write_ok = false;
+        return 0;
+    }
+    sink->written += (int64_t)total;
+    if (sink->progress)
+        sink->progress->fetch_add((int64_t)total, std::memory_order_relaxed);
+    return total;
+}
+
 void msr_fetch_and_cache_audio_background(const String & cid, const String & sourceUrl)
 {
     if (!cid || !sourceUrl || !aud_get_bool("monster-siren", "enable_cache") || !aud_get_bool("monster-siren", "cache_audio"))
@@ -552,6 +967,7 @@ void msr_fetch_and_cache_audio_background(const String & cid, const String & sou
     if (msr_find_cached_audio(cid, existing_path))
         return;
 
+    msr_ensure_curl_init();
     String cache_dir = msr_get_cache_dir();
     StringBuf audio_dir = filename_build({cache_dir, "audio"});
     QDir().mkpath(QString::fromUtf8((const char *)audio_dir));
@@ -559,42 +975,55 @@ void msr_fetch_and_cache_audio_background(const String & cid, const String & sou
     String ext = msr_audio_ext_for_url(sourceUrl);
     StringBuf filepath = filename_build({audio_dir, StringBuf(str_concat({"audio_", cid, ext}))});
 
-    for (int attempt = 0; attempt < 3 && !g_shutting_down; attempt++) {
-        VFSFile remote(sourceUrl, "r");
-        if (remote) {
-            int64_t expected = remote.fsize();
-            QSaveFile out(QString::fromUtf8((const char *)filepath));
-            if (!out.open(QIODevice::WriteOnly))
-                return;
+    for (int attempt = 0; attempt < 3 && !msr_is_shutting_down(); attempt++) {
+        QSaveFile out(QString::fromUtf8((const char *)filepath));
+        if (!out.open(QIODevice::WriteOnly))
+            return;
 
-            char buf[65536];
-            int64_t written = 0;
-            bool write_ok = true;
-            while (!g_shutting_down) {
-                int64_t n = remote.fread(buf, 1, sizeof(buf));
-                if (n <= 0)
-                    break;
-                if (out.write(buf, n) != n) {
-                    write_ok = false;
-                    break;
-                }
-                written += n;
-            }
-
-            bool complete = !g_shutting_down && write_ok && written > 0 &&
-                            ((expected > 0) ? (written >= expected) : remote.feof());
-            if (complete && out.commit())
-                return;
+        CURL * easy = curl_easy_init();
+        if (!easy) {
             out.cancelWriting();
+            return;
         }
 
-        if (attempt < 2 && !g_shutting_down)
-            QThread::msleep(150 * (attempt + 1));
+        std::atomic<int64_t> progress{0};
+        CurlFileSink sink{&out, &progress, 0, true};
+
+        msr_configure_curl_handle(easy, (const char *)sourceUrl, 10000L, false);
+        curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, msr_curl_progress_header_cb);
+        curl_easy_setopt(easy, CURLOPT_HEADERDATA, &progress);
+        curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, msr_curl_file_write_cb);
+        curl_easy_setopt(easy, CURLOPT_WRITEDATA, &sink);
+
+        CurlTransferOutcome outcome = msr_perform_curl_interruptible(
+            easy, progress, 15000, 0, nullptr);
+
+        curl_off_t expected = -1;
+        curl_easy_getinfo(easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &expected);
+        curl_easy_cleanup(easy);
+
+        bool complete = !outcome.cancelled && !outcome.timed_out &&
+                        sink.write_ok && sink.written > 0 &&
+                        outcome.curl_code == CURLE_OK &&
+                        outcome.http_status >= 200 && outcome.http_status < 300 &&
+                        (expected <= 0 || sink.written >= (int64_t)expected);
+        if (complete && out.commit())
+            return;
+        out.cancelWriting();
+
+        if (outcome.cancelled || msr_is_nonretryable_http_status(outcome.http_status))
+            return;
+
+        if (attempt < 2)
+            msr_sleep_interruptible(150 * (attempt + 1), nullptr);
     }
 }
 
-std::vector<MsrAlbum> msr_fetch_albums(bool force_network)
+std::vector<MsrAlbum> msr_fetch_albums(bool force_network, const MsrCancelFn & should_cancel)
 {
+    if (msr_should_abort(should_cancel))
+        return {};
+
     if (!force_network) {
         std::lock_guard<std::mutex> lock(g_cache_mutex);
         if (g_albums_cached && !g_cached_albums.empty())
@@ -614,10 +1043,10 @@ std::vector<MsrAlbum> msr_fetch_albums(bool force_network)
         }
     }
 
-    QJsonDocument doc = msr_fetch_json("https://monster-siren.hypergryph.com/api/albums");
+    QJsonDocument doc = msr_fetch_json("https://monster-siren.hypergryph.com/api/albums", should_cancel);
     std::vector<MsrAlbum> albums;
     if (!doc.isObject()) {
-        if (!force_network && msr_load_catalog_from_cache(albums)) {
+        if (!msr_should_abort(should_cancel) && !force_network && msr_load_catalog_from_cache(albums)) {
             std::lock_guard<std::mutex> lock(g_cache_mutex);
             g_cached_albums = albums;
             g_albums_cached = true;
@@ -645,10 +1074,8 @@ std::vector<MsrAlbum> msr_fetch_albums(bool force_network)
         albums.push_back(std::move(album));
     }
 
-    if (!albums.empty())
+    if (!albums.empty()) {
         msr_save_catalog_to_cache(albums);
-
-    {
         std::lock_guard<std::mutex> lock(g_cache_mutex);
         g_cached_albums = albums;
         g_albums_cached = true;
@@ -802,7 +1229,7 @@ void msr_invalidate_song_detail(const String & cid)
 
 MsrAlbum msr_fetch_album_detail(const String & cid)
 {
-    if (!cid)
+    if (!cid || msr_is_shutting_down())
         return MsrAlbum();
 
     std::string key((const char *)cid);
@@ -864,7 +1291,7 @@ MsrAlbum msr_fetch_album_detail(const String & cid)
 
 MsrSongDetail msr_fetch_song_detail(const String & cid)
 {
-    if (!cid)
+    if (!cid || msr_is_shutting_down())
         return MsrSongDetail();
 
     std::string key((const char *)cid);
@@ -906,10 +1333,10 @@ MsrSongDetail msr_fetch_song_detail(const String & cid)
     return detail;
 }
 
-Index<char> msr_fetch_image(const String & url)
+Index<char> msr_fetch_image(const String & url, const MsrCancelFn & should_cancel)
 {
     Index<char> result;
-    if (!url || !url[0])
+    if (!url || !url[0] || msr_should_abort(should_cancel))
         return result;
 
     std::string key((const char *)url);
@@ -935,7 +1362,7 @@ Index<char> msr_fetch_image(const String & url)
         }
     }
 
-    QByteArray bytes = msr_fetch_bytes(QString::fromUtf8((const char *)url));
+    QByteArray bytes = msr_fetch_bytes(QString::fromUtf8((const char *)url), 0, should_cancel);
     if (!bytes.isEmpty()) {
         result.insert(bytes.constData(), 0, bytes.size());
         msr_save_art_to_cache(url, result);
@@ -952,7 +1379,7 @@ Index<char> msr_fetch_image(const String & url)
 
 String msr_fetch_lyrics(const String & url)
 {
-    if (!url || !url[0])
+    if (!url || !url[0] || msr_is_shutting_down())
         return String();
 
     std::string key((const char *)url);
@@ -979,7 +1406,7 @@ String msr_fetch_lyrics(const String & url)
     }
 
     AUDINFO("MSR: msr_fetch_lyrics downloading over HTTPS: %s\n", (const char *)url);
-    QByteArray bytes = msr_fetch_bytes(QString::fromUtf8((const char *)url));
+    QByteArray bytes = msr_fetch_bytes(QString::fromUtf8((const char *)url), 25000);
     if (bytes.isEmpty()) {
         AUDWARN("MSR: msr_fetch_lyrics failed or empty response for %s\n", (const char *)url);
         return String();

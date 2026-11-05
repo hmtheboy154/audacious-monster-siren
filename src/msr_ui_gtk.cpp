@@ -128,7 +128,13 @@ public:
     /* Called while the plugin module is still loaded, before General plugin
      * teardown dlcloses it. Waits for any catalog/image workers so they can
      * never execute into freed transport code after module unload. */
-    void cleanup() override { msr_wait_for_background_threads(); }
+    void cleanup() override
+    {
+        PluginHandle * self = aud_plugin_by_header(this);
+        if (self && aud_plugin_get_enabled(self))
+            msr_notify_app_shutdown();
+        msr_wait_for_background_threads();
+    }
     void * get_gtk_widget() override;
 };
 
@@ -505,11 +511,15 @@ static void start_async_image_loader(std::shared_ptr<GtkCatalogContext> ctx)
     }
 
     msr_run_background([ctx, gen, covers = std::move(covers)]() {
+        auto cancel = [ctx, gen]() {
+            return ctx->destroyed.load(std::memory_order_relaxed) ||
+                   ctx->catalog_gen.load(std::memory_order_relaxed) != gen;
+        };
         for (const auto & info : covers) {
-            if (ctx->destroyed || ctx->catalog_gen.load() != gen) break;
+            if (cancel()) break;
 
-            Index<char> img_bytes = msr_fetch_image(String(info.url.c_str()));
-            if (ctx->destroyed || ctx->catalog_gen.load() != gen || !img_bytes.len()) continue;
+            Index<char> img_bytes = msr_fetch_image(String(info.url.c_str()), cancel);
+            if (cancel() || !img_bytes.len()) continue;
 
             GdkPixbufLoader * loader = gdk_pixbuf_loader_new();
             gdk_pixbuf_loader_write(loader, (const guchar *)img_bytes.begin(), img_bytes.len(), nullptr);
@@ -562,16 +572,23 @@ static gboolean on_catalog_loaded_idle(gpointer user_data)
             gtk_widget_set_sensitive(ctx->refresh_btn, TRUE);
 
         if (ctx->status_label) {
-            char status_buf[256];
-            snprintf(status_buf, sizeof(status_buf),
-                     _("Catalog loaded: %zu albums.\nDouble-click to clear queue & play."),
-                     data->albums.size());
-            gtk_label_set_text(GTK_LABEL(ctx->status_label), status_buf);
+            if (data->albums.empty()) {
+                gtk_label_set_text(GTK_LABEL(ctx->status_label),
+                                   _("Failed to load Monster Siren catalog.\nClick Refresh to retry."));
+            } else {
+                char status_buf[256];
+                snprintf(status_buf, sizeof(status_buf),
+                         _("Catalog loaded: %zu albums.\nDouble-click to clear queue & play."),
+                         data->albums.size());
+                gtk_label_set_text(GTK_LABEL(ctx->status_label), status_buf);
+            }
         }
 
-        int mode = (ctx->current_mode >= 0) ? ctx->current_mode
-                                            : aud_get_int("monster-siren", "default_view_mode");
-        maybe_start_image_loader(data->ctx.get(), mode);
+        if (!data->albums.empty()) {
+            int mode = (ctx->current_mode >= 0) ? ctx->current_mode
+                                                : aud_get_int("monster-siren", "default_view_mode");
+            maybe_start_image_loader(data->ctx.get(), mode);
+        }
     }
 
     delete data;
@@ -583,7 +600,7 @@ static void fetch_and_populate_catalog(std::shared_ptr<GtkCatalogContext> ctx, b
     if (!ctx)
         return;
 
-    uint64_t req_gen = ++ctx->catalog_gen;
+    uint64_t req_gen = ctx->catalog_gen.fetch_add(1, std::memory_order_acq_rel) + 1;
     ctx->images_loaded_gen = 0;
     if (ctx->store)
         gtk_list_store_clear(ctx->store);
@@ -594,8 +611,12 @@ static void fetch_and_populate_catalog(std::shared_ptr<GtkCatalogContext> ctx, b
         gtk_label_set_text(GTK_LABEL(ctx->status_label), _("Loading Monster Siren catalog..."));
 
     msr_run_background([ctx, req_gen, force_network]() {
-        std::vector<MsrAlbum> albums = msr_fetch_albums(force_network);
-        if (ctx->destroyed || ctx->catalog_gen.load() != req_gen)
+        auto cancel = [ctx, req_gen]() {
+            return ctx->destroyed.load(std::memory_order_relaxed) ||
+                   ctx->catalog_gen.load(std::memory_order_relaxed) != req_gen;
+        };
+        std::vector<MsrAlbum> albums = msr_fetch_albums(force_network, cancel);
+        if (cancel())
             return;
 
         CatalogPopulateData * data = new CatalogPopulateData{ctx, req_gen, std::move(albums)};

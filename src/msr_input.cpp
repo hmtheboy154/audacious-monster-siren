@@ -68,20 +68,19 @@ static uint32_t read_be32(const uint8_t * p)
            ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
+using HeaderRefillFn = std::function<int64_t(int64_t offset, uint8_t * buf, int64_t max_len)>;
+
 /**
  * Parses WAV (RIFF), FLAC (STREAMINFO), or MP3 (Xing/VBRI VBR or CBR + HTTP
- * Content-Length) headers from an open VFSFile using bounded reads so probing
- * a remote stream never seeks to the end of the file or downloads the full
- * track just to learn its duration.
+ * Content-Length) headers from a bounded initial buffer so probing a remote
+ * stream never seeks to the end of the file or downloads the full track just
+ * to learn its duration.
  */
-static bool probe_header_length(VFSFile & file, Tuple & target_tuple)
+static bool parse_header_length(uint8_t * buf, int64_t n, int64_t total_size,
+                                const HeaderRefillFn & refill_at, Tuple & target_tuple)
 {
-    uint8_t buf[65536];
-    int64_t n = file.fread(buf, 1, sizeof(buf));
     if (n < 12)
         return false;
-
-    int64_t total_size = file.fsize();
 
     // 1. RIFF/WAVE
     if (memcmp(buf, "RIFF", 4) == 0 && memcmp(buf + 8, "WAVE", 4) == 0) {
@@ -129,8 +128,10 @@ static bool probe_header_length(VFSFile & file, Tuple & target_tuple)
         if (audio_offset < n) {
             p = buf + audio_offset;
             avail = n - audio_offset;
-        } else if (audio_offset <= 1024 * 1024 && file.fseek(audio_offset, VFS_SEEK_SET) == 0) {
-            n = file.fread(buf, 1, sizeof(buf));
+        } else if (audio_offset <= 1024 * 1024 && refill_at) {
+            n = refill_at(audio_offset, buf, 65536);
+            if (n < 4)
+                return false;
             p = buf;
             avail = n;
         } else {
@@ -237,40 +238,79 @@ static bool probe_header_length(VFSFile & file, Tuple & target_tuple)
 }
 
 /**
- * Helper function to probe audio stream duration over VFS.
+ * Helper function to probe audio stream duration.
+ * Uses local VFS for cached files and bounded libcurl HTTP range requests for
+ * remote streams so playlist scanning never spawns blocking Neon reader threads.
  * Returns false only when opening a remote stream failed (e.g. expired CDN
  * token), allowing callers to refresh song detail and retry once.
  */
 static bool probe_remote_length(const String & cid, const String & sourceUrl, Tuple & target_tuple)
 {
-    if (!sourceUrl || !sourceUrl[0])
+    if (!sourceUrl || !sourceUrl[0] || msr_is_shutting_down())
         return true;
 
-    String probe_url = sourceUrl;
     String cached_path;
     bool use_cache = cid && msr_find_cached_audio(cid, cached_path);
-    if (use_cache) {
-        probe_url = String(filename_to_uri(cached_path));
-        AUDINFO("MSR: probe_remote_length using local audio cache for cid %s -> %s\n", (const char *)cid, (const char *)probe_url);
-    } else {
-        AUDINFO("MSR: probe_remote_length probing remote URL for cid %s -> %s\n", (const char *)cid, (const char *)probe_url);
+    if (!use_cache) {
+        AUDINFO("MSR: probe_remote_length probing remote URL for cid %s -> %s\n",
+                (const char *)cid, (const char *)sourceUrl);
+
+        Index<char> header_bytes;
+        int64_t total_size = -1;
+        if (!msr_http_fetch_range((const char *)sourceUrl, 0, 65536, header_bytes, total_size)) {
+            if (msr_is_shutting_down())
+                return true;
+            AUDWARN("MSR: probe_remote_length failed to fetch header range for %s\n", (const char *)sourceUrl);
+            return false;
+        }
+
+        uint8_t buf[65536];
+        int64_t n = std::min<int64_t>(header_bytes.len(), (int64_t)sizeof(buf));
+        memcpy(buf, header_bytes.begin(), (size_t)n);
+
+        auto refill_remote = [&sourceUrl](int64_t offset, uint8_t * dst, int64_t max_len) -> int64_t {
+            Index<char> more;
+            int64_t unused_total = -1;
+            if (!msr_http_fetch_range((const char *)sourceUrl, offset, max_len, more, unused_total))
+                return 0;
+            int64_t got = std::min<int64_t>(more.len(), max_len);
+            if (got > 0)
+                memcpy(dst, more.begin(), (size_t)got);
+            return got;
+        };
+
+        if (parse_header_length(buf, n, total_size, refill_remote, target_tuple)) {
+            AUDINFO("MSR: probe_remote_length (header parse) success for cid %s -> Length: %d ms, Bitrate: %d\n",
+                    (const char *)cid, target_tuple.get_int(Tuple::Length), target_tuple.get_int(Tuple::Bitrate));
+        } else {
+            AUDINFO("MSR: probe_remote_length: unrecognized remote header for %s, length stays unknown\n",
+                    (const char *)sourceUrl);
+        }
+        return true;
     }
+
+    String probe_url = String(filename_to_uri(cached_path));
+    AUDINFO("MSR: probe_remote_length using local audio cache for cid %s -> %s\n",
+            (const char *)cid, (const char *)probe_url);
 
     VFSFile probe_file(probe_url, "r");
     if (!probe_file) {
-        AUDWARN("MSR: probe_remote_length failed to open VFSFile for %s\n", (const char *)probe_url);
-        return use_cache;
-    }
-    if (probe_header_length(probe_file, target_tuple)) {
-        AUDINFO("MSR: probe_remote_length (header parse) success for cid %s -> Length: %d ms, Bitrate: %d\n",
-                (const char *)cid, target_tuple.get_int(Tuple::Length), target_tuple.get_int(Tuple::Bitrate));
+        AUDWARN("MSR: probe_remote_length failed to open local VFSFile for %s\n", (const char *)probe_url);
         return true;
     }
 
-    /* Full decoder probing is only safe for local files; on a remote URL the
-     * decoder's end-of-stream seek would download the whole track. */
-    if (!use_cache) {
-        AUDINFO("MSR: probe_remote_length: unrecognized remote header for %s, length stays unknown\n", (const char *)probe_url);
+    uint8_t buf[65536];
+    int64_t n = probe_file.fread(buf, 1, sizeof(buf));
+    int64_t total_size = probe_file.fsize();
+    auto refill_local = [&probe_file](int64_t offset, uint8_t * dst, int64_t max_len) -> int64_t {
+        if (probe_file.fseek(offset, VFS_SEEK_SET) != 0)
+            return 0;
+        return probe_file.fread(dst, 1, max_len);
+    };
+
+    if (parse_header_length(buf, n, total_size, refill_local, target_tuple)) {
+        AUDINFO("MSR: probe_remote_length (header parse) success for cid %s -> Length: %d ms, Bitrate: %d\n",
+                (const char *)cid, target_tuple.get_int(Tuple::Length), target_tuple.get_int(Tuple::Bitrate));
         return true;
     }
 
@@ -379,6 +419,8 @@ public:
     bool read_tag(const char * filename, VFSFile & file, Tuple & tuple, Index<char> * image) override
     {
         (void)file;
+        if (msr_is_shutting_down())
+            return false;
         MsrUrlParsed parsed = msr_parse_url(filename);
         if (parsed.type == MsrUrlType::Unknown)
             return false;
@@ -513,6 +555,8 @@ public:
      */
     bool play(const char * filename, VFSFile & file) override
     {
+        if (msr_is_shutting_down())
+            return false;
         MsrUrlParsed parsed = msr_parse_url(filename);
         String song_cid;
 
@@ -630,8 +674,12 @@ public:
         if (t.valid())
             set_playback_tuple(std::move(t));
 
-        // Always open a fresh, clean VFSFile from byte 0 for audio streaming/playback so seeking works reliably
-        AUDINFO("MSR: Handing off to underlying decoder %s with clean VFSFile\n", aud_plugin_get_name(decoder));
+        // Reuse source_file when still positioned at byte 0 (or rewindable);
+        // otherwise open a fresh VFSFile so seeking starts cleanly from byte 0.
+        AUDINFO("MSR: Handing off to underlying decoder %s\n", aud_plugin_get_name(decoder));
+        if (source_file && (source_file.ftell() == 0 || source_file.fseek(0, VFS_SEEK_SET) == 0))
+            return ip->play(stream_url, source_file);
+
         VFSFile clean_file(stream_url, "r");
         if (!clean_file) {
             AUDERR("Could not open VFS connection to %s for playback\n", (const char *)stream_url);
