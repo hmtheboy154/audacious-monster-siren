@@ -55,60 +55,195 @@ static const PreferencesWidget msr_input_widgets[] = {
 
 static const PluginPreferences msr_input_prefs = {.widgets = msr_input_widgets, .init = nullptr, .apply = nullptr, .cleanup = nullptr};
 
-/**
- * Parses a RIFF/WAVE header from an open VFSFile using a bounded read and
- * derives the stream duration from the fmt/data chunks. Unlike delegating to
- * the sndfile decoder, this never fseeks to the end of the stream, so probing
- * a remote file no longer forces the HTTP transport to download the entire
- * track (e.g. a 70MB WAV) just to learn its length.
- */
-static bool probe_wav_length(VFSFile & file, Tuple & target_tuple)
+static uint32_t read_le32(const uint8_t * p)
 {
-    char buf[65536];
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint32_t read_be32(const uint8_t * p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+/**
+ * Parses WAV (RIFF), FLAC (STREAMINFO), or MP3 (Xing/VBRI VBR or CBR + HTTP
+ * Content-Length) headers from an open VFSFile using bounded reads so probing
+ * a remote stream never seeks to the end of the file or downloads the full
+ * track just to learn its duration.
+ */
+static bool probe_header_length(VFSFile & file, Tuple & target_tuple)
+{
+    uint8_t buf[65536];
     int64_t n = file.fread(buf, 1, sizeof(buf));
-    if (n < 12 || memcmp(buf, "RIFF", 4) || memcmp(buf + 8, "WAVE", 4))
+    if (n < 12)
         return false;
 
-    auto le32 = [](const char * p) {
-        return (uint32_t)(uint8_t)p[0] | ((uint32_t)(uint8_t)p[1] << 8) |
-               ((uint32_t)(uint8_t)p[2] << 16) | ((uint32_t)(uint8_t)p[3] << 24);
-    };
+    int64_t total_size = file.fsize();
 
-    int64_t pos = 12;
-    uint32_t byte_rate = 0, data_size = 0;
-    bool have_fmt = false;
+    // 1. RIFF/WAVE
+    if (memcmp(buf, "RIFF", 4) == 0 && memcmp(buf + 8, "WAVE", 4) == 0) {
+        int64_t pos = 12;
+        uint32_t byte_rate = 0, data_size = 0;
+        bool have_fmt = false;
 
-    while (pos + 8 <= n) {
-        uint32_t chunk_size = le32(buf + pos + 4);
-        if (memcmp(buf + pos, "fmt ", 4) == 0 && chunk_size >= 16 && pos + 8 + 16 <= n) {
-            byte_rate = le32(buf + pos + 16);
-            have_fmt = true;
-        } else if (memcmp(buf + pos, "data", 4) == 0) {
-            data_size = chunk_size;
-            break;
+        while (pos + 8 <= n) {
+            uint32_t chunk_size = read_le32(buf + pos + 4);
+            if (memcmp(buf + pos, "fmt ", 4) == 0 && chunk_size >= 16 && pos + 8 + 16 <= n) {
+                byte_rate = read_le32(buf + pos + 16);
+                have_fmt = true;
+            } else if (memcmp(buf + pos, "data", 4) == 0) {
+                data_size = chunk_size;
+                break;
+            }
+            pos += 8 + (int64_t)chunk_size + (chunk_size & 1);
         }
-        pos += 8 + chunk_size + (chunk_size & 1);
+
+        if (have_fmt && byte_rate > 0) {
+            int64_t pcm_bytes = data_size;
+            if (pcm_bytes <= 0 && total_size > pos)
+                pcm_bytes = total_size - pos;
+            if (pcm_bytes > 0) {
+                target_tuple.set_int(Tuple::Length, (int)(pcm_bytes * 1000 / byte_rate));
+                target_tuple.set_int(Tuple::Bitrate, (int)((int64_t)byte_rate * 8 / 1000));
+                return true;
+            }
+        }
+        return false;
     }
 
-    if (have_fmt && byte_rate > 0 && data_size > 0) {
-        target_tuple.set_int(Tuple::Length, (int)((int64_t)data_size * 1000 / byte_rate));
-        target_tuple.set_int(Tuple::Bitrate, (int)byte_rate * 8);
-        return true;
+    // Skip optional leading ID3v2 tag (bounded to <= 1 MiB on remote streams)
+    int64_t audio_offset = 0;
+    const uint8_t * p = buf;
+    int64_t avail = n;
+
+    if (memcmp(buf, "ID3", 3) == 0 &&
+        (buf[6] & 0x80) == 0 && (buf[7] & 0x80) == 0 &&
+        (buf[8] & 0x80) == 0 && (buf[9] & 0x80) == 0)
+    {
+        int64_t tag_size = ((int64_t)buf[6] << 21) | ((int64_t)buf[7] << 14) |
+                           ((int64_t)buf[8] << 7) | (int64_t)buf[9];
+        audio_offset = 10 + tag_size + ((buf[5] & 0x10) ? 10 : 0);
+        if (audio_offset < n) {
+            p = buf + audio_offset;
+            avail = n - audio_offset;
+        } else if (audio_offset <= 1024 * 1024 && file.fseek(audio_offset, VFS_SEEK_SET) == 0) {
+            n = file.fread(buf, 1, sizeof(buf));
+            p = buf;
+            avail = n;
+        } else {
+            return false;
+        }
     }
+
+    // 2. FLAC (STREAMINFO metadata block)
+    if (avail >= 42 && memcmp(p, "fLaC", 4) == 0 && (p[4] & 0x7F) == 0) {
+        const uint8_t * s = p + 8;
+        uint32_t sample_rate = ((uint32_t)s[10] << 12) | ((uint32_t)s[11] << 4) |
+                               ((uint32_t)s[12] >> 4);
+        uint64_t total_samples = (((uint64_t)(s[13] & 0x0F)) << 32) |
+                                 ((uint64_t)s[14] << 24) | ((uint64_t)s[15] << 16) |
+                                 ((uint64_t)s[16] << 8) | (uint64_t)s[17];
+        if (sample_rate > 0 && total_samples > 0) {
+            int length_ms = (int)(total_samples * 1000 / sample_rate);
+            if (length_ms > 0) {
+                target_tuple.set_int(Tuple::Length, length_ms);
+                if (total_size > audio_offset)
+                    target_tuple.set_int(Tuple::Bitrate, (int)((total_size - audio_offset) * 8 / length_ms));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 3. MPEG Audio (MP3 Layer III / Layer II)
+    static const int mpeg1_l3_br[16] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0};
+    static const int mpeg1_l2_br[16] = {0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0};
+    static const int mpeg2_l3_br[16] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0};
+    static const int mpeg1_sr[4] = {44100, 48000, 32000, 0};
+    static const int mpeg2_sr[4] = {22050, 24000, 16000, 0};
+    static const int mpeg25_sr[4] = {11025, 12000, 8000, 0};
+
+    for (int64_t i = 0; i + 4 <= avail; i++) {
+        if (p[i] != 0xFF || (p[i + 1] & 0xE0) != 0xE0)
+            continue;
+
+        int ver = (p[i + 1] >> 3) & 0x03;
+        int layer = (p[i + 1] >> 1) & 0x03;
+        int br_idx = (p[i + 2] >> 4) & 0x0F;
+        int sr_idx = (p[i + 2] >> 2) & 0x03;
+        int pad = (p[i + 2] >> 1) & 0x01;
+        int chan_mode = (p[i + 3] >> 6) & 0x03;
+
+        if (ver == 1 || (layer != 1 && layer != 2) || br_idx == 0 || br_idx == 15 || sr_idx == 3)
+            continue;
+
+        int sr = (ver == 3) ? mpeg1_sr[sr_idx] : (ver == 2 ? mpeg2_sr[sr_idx] : mpeg25_sr[sr_idx]);
+        int br = (ver == 3) ? (layer == 1 ? mpeg1_l3_br[br_idx] : mpeg1_l2_br[br_idx])
+                            : mpeg2_l3_br[br_idx];
+        int spf = (layer == 1 && ver != 3) ? 576 : 1152;
+        if (sr <= 0 || br <= 0)
+            continue;
+
+        int frame_size = (spf / 8 * br * 1000) / sr + pad;
+        if (frame_size < 24)
+            continue;
+        if (i + frame_size + 2 <= avail &&
+            (p[i + frame_size] != 0xFF || (p[i + frame_size + 1] & 0xE0) != 0xE0))
+            continue;
+
+        uint32_t total_frames = 0;
+        if (layer == 1) {
+            int side_info = (ver == 3) ? ((chan_mode == 3) ? 17 : 32)
+                                       : ((chan_mode == 3) ? 9 : 17);
+            int64_t xing_pos = i + 4 + side_info;
+            if (xing_pos + 12 <= avail &&
+                (memcmp(p + xing_pos, "Xing", 4) == 0 || memcmp(p + xing_pos, "Info", 4) == 0))
+            {
+                uint32_t flags = read_be32(p + xing_pos + 4);
+                if (flags & 0x01)
+                    total_frames = read_be32(p + xing_pos + 8);
+            }
+            int64_t vbri_pos = i + 4 + 32;
+            if (total_frames == 0 && vbri_pos + 18 <= avail && memcmp(p + vbri_pos, "VBRI", 4) == 0)
+                total_frames = read_be32(p + vbri_pos + 14);
+        }
+
+        if (total_frames > 0) {
+            int length_ms = (int)((int64_t)total_frames * spf * 1000 / sr);
+            if (length_ms > 0) {
+                target_tuple.set_int(Tuple::Length, length_ms);
+                int kbps = (total_size > audio_offset + i)
+                               ? (int)((total_size - audio_offset - i) * 8 / length_ms)
+                               : br;
+                target_tuple.set_int(Tuple::Bitrate, kbps);
+                return true;
+            }
+        } else if (total_size > audio_offset + i) {
+            int64_t stream_bytes = total_size - audio_offset - i;
+            int length_ms = (int)(stream_bytes * 8 / br);
+            if (length_ms > 0) {
+                target_tuple.set_int(Tuple::Length, length_ms);
+                target_tuple.set_int(Tuple::Bitrate, br);
+                return true;
+            }
+        }
+        break;
+    }
+
     return false;
 }
 
 /**
  * Helper function to probe audio stream duration over VFS.
- * By parsing the RIFF header (or, for offline files only, querying the
- * underlying audio decoder) before playback, we ensure Tuple::Length is set
- * (> 0). This enables Audacious to display exact track timestamps on the
- * seekbar and permits seeking via HTTP byte-range requests.
+ * Returns false only when opening a remote stream failed (e.g. expired CDN
+ * token), allowing callers to refresh song detail and retry once.
  */
-static void probe_remote_length(const String & cid, const String & sourceUrl, Tuple & target_tuple)
+static bool probe_remote_length(const String & cid, const String & sourceUrl, Tuple & target_tuple)
 {
     if (!sourceUrl || !sourceUrl[0])
-        return;
+        return true;
 
     String probe_url = sourceUrl;
     String cached_path;
@@ -123,19 +258,19 @@ static void probe_remote_length(const String & cid, const String & sourceUrl, Tu
     VFSFile probe_file(probe_url, "r");
     if (!probe_file) {
         AUDWARN("MSR: probe_remote_length failed to open VFSFile for %s\n", (const char *)probe_url);
-        return;
+        return use_cache;
     }
-    if (probe_wav_length(probe_file, target_tuple)) {
+    if (probe_header_length(probe_file, target_tuple)) {
         AUDINFO("MSR: probe_remote_length (header parse) success for cid %s -> Length: %d ms, Bitrate: %d\n",
                 (const char *)cid, target_tuple.get_int(Tuple::Length), target_tuple.get_int(Tuple::Bitrate));
-        return;
+        return true;
     }
 
     /* Full decoder probing is only safe for local files; on a remote URL the
      * decoder's end-of-stream seek would download the whole track. */
     if (!use_cache) {
-        AUDINFO("MSR: probe_remote_length: no RIFF header for %s, length stays unknown\n", (const char *)probe_url);
-        return;
+        AUDINFO("MSR: probe_remote_length: unrecognized remote header for %s, length stays unknown\n", (const char *)probe_url);
+        return true;
     }
 
     if (probe_file.fseek(0, VFS_SEEK_SET) != 0) {
@@ -146,11 +281,11 @@ static void probe_remote_length(const String & cid, const String & sourceUrl, Tu
         decoder = aud_file_find_decoder(probe_url, false, probe_file);
     if (!decoder) {
         AUDWARN("MSR: probe_remote_length found no decoder for %s\n", (const char *)probe_url);
-        return;
+        return true;
     }
     auto ip = (InputPlugin *)aud_plugin_get_header(decoder);
     if (!ip)
-        return;
+        return true;
     Tuple stream_tuple;
     if (ip->read_tag(probe_url, probe_file, stream_tuple, nullptr)) {
         if (stream_tuple.get_int(Tuple::Length) > 0)
@@ -158,6 +293,37 @@ static void probe_remote_length(const String & cid, const String & sourceUrl, Tu
         if (stream_tuple.get_int(Tuple::Bitrate) > 0)
             target_tuple.set_int(Tuple::Bitrate, stream_tuple.get_int(Tuple::Bitrate));
         AUDINFO("MSR: probe_remote_length success for cid %s -> Length: %d ms, Bitrate: %d\n", (const char *)cid, target_tuple.get_int(Tuple::Length), target_tuple.get_int(Tuple::Bitrate));
+    }
+    return true;
+}
+
+static void ensure_song_duration(MsrSongDetail & song, Tuple & tuple, bool playback_prep)
+{
+    if (tuple.get_int(Tuple::Length) > 0 || !song.cid)
+        return;
+
+    if (song.duration_ms > 0) {
+        tuple.set_int(Tuple::Length, song.duration_ms);
+        return;
+    }
+
+    if (!song.sourceUrl || !song.sourceUrl[0])
+        return;
+
+    AUDINFO("MSR: Probing duration for cid %s (%s)\n", (const char *)song.cid,
+            playback_prep ? "playback prep" : "catalog scan");
+    if (!probe_remote_length(song.cid, song.sourceUrl, tuple)) {
+        AUDWARN("MSR: Duration probe failed to open %s (likely expired token); refreshing song detail\n",
+                (const char *)song.sourceUrl);
+        msr_invalidate_song_detail(song.cid);
+        song = msr_fetch_song_detail(song.cid);
+        if (song.sourceUrl && song.sourceUrl[0])
+            probe_remote_length(song.cid, song.sourceUrl, tuple);
+    }
+
+    if (tuple.get_int(Tuple::Length) > 0) {
+        song.duration_ms = tuple.get_int(Tuple::Length);
+        msr_save_song_detail_to_cache(song);
     }
 }
 
@@ -264,27 +430,14 @@ public:
             // nullptr) as well as during playback prep makes Tuple::Length
             // deterministic, which is what enables the seekbar / timestamp
             // seeking in Audacious.
-            if (tuple.get_int(Tuple::Length) <= 0) {
-                MsrSongDetail song = msr_fetch_song_detail(track.cid);
-                if (song.duration_ms > 0) {
-                    tuple.set_int(Tuple::Length, song.duration_ms);
-                } else if (song.sourceUrl && song.sourceUrl[0]) {
-                    AUDINFO("MSR: Probing duration for cid %s (%s)\n", (const char *)track.cid,
-                            image ? "playback prep" : "catalog scan");
-                    probe_remote_length(track.cid, song.sourceUrl, tuple);
-                    if (tuple.get_int(Tuple::Length) > 0) {
-                        song.duration_ms = tuple.get_int(Tuple::Length);
-                        msr_save_song_detail_to_cache(song);
-                    }
-                }
-            }
+            MsrSongDetail song = msr_fetch_song_detail(track.cid);
+            ensure_song_duration(song, tuple, image != nullptr);
 
             // Populate lyrics (Tuple::Lyrics) in both scan and playback modes so
             // Audacious's lyric plugins (lyrics-qt, lyrics-gtk) show Monster
             // Siren's own lyrics instead of falling back to third-party sources.
             // A placeholder is always set when MSR provides no lyrics.
             if (!tuple.get_str(Tuple::Lyrics)) {
-                MsrSongDetail song = msr_fetch_song_detail(track.cid);
                 if (song.lyricUrl && song.lyricUrl[0]) {
                     String cached_lyric_path;
                     if (msr_find_cached_lyrics(song.lyricUrl, cached_lyric_path))
@@ -329,19 +482,7 @@ public:
                 AUDINFO("MSR: read_tag (SCAN/FAST mode, image=null) for standalone song %s (cid: %s)\n", filename, (const char *)song.cid);
             }
 
-            if (tuple.get_int(Tuple::Length) <= 0) {
-                if (song.duration_ms > 0) {
-                    tuple.set_int(Tuple::Length, song.duration_ms);
-                } else if (song.sourceUrl && song.sourceUrl[0]) {
-                    AUDINFO("MSR: Probing duration for standalone song cid %s (%s)\n", (const char *)song.cid,
-                            image ? "playback prep" : "catalog scan");
-                    probe_remote_length(song.cid, song.sourceUrl, tuple);
-                    if (tuple.get_int(Tuple::Length) > 0) {
-                        song.duration_ms = tuple.get_int(Tuple::Length);
-                        msr_save_song_detail_to_cache(song);
-                    }
-                }
-            }
+            ensure_song_duration(song, tuple, image != nullptr);
 
             if (!tuple.get_str(Tuple::Lyrics)) {
                 if (song.lyricUrl && song.lyricUrl[0]) {
