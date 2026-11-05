@@ -33,6 +33,7 @@
 
 #include <libaudcore/runtime.h>
 #include <libaudcore/audstrings.h>
+#include <libaudcore/hook.h>
 #include <libaudcore/plugin.h>
 #include <QStandardPaths>
 
@@ -58,10 +59,30 @@ struct WorkerEntry {
 static std::mutex g_thread_mutex;
 static std::vector<WorkerEntry> g_threads;
 static std::atomic<bool> g_shutting_down{false};
+static bool g_hooks_registered = false;
+
+static void on_cache_clear_hook(void *, void *)
+{
+    msr_cache_clear();
+}
+
+static void on_song_invalidate_hook(void * data, void *)
+{
+    const char * cid = (const char *)data;
+    if (!cid || !cid[0])
+        return;
+    std::lock_guard<std::mutex> lock(g_cache_mutex);
+    g_cached_song_details.erase(std::string(cid));
+}
 
 void msr_reset_shutdown()
 {
     g_shutting_down = false;
+    if (!g_hooks_registered) {
+        hook_associate("msr cache clear", on_cache_clear_hook, nullptr);
+        hook_associate("msr song invalidate", on_song_invalidate_hook, nullptr);
+        g_hooks_registered = true;
+    }
 }
 
 void msr_run_background(std::function<void()> task)
@@ -117,6 +138,12 @@ void msr_wait_for_background_threads()
     for (auto & entry : entries)
         if (entry.thread.joinable())
             entry.thread.join();
+
+    if (g_hooks_registered) {
+        hook_dissociate("msr cache clear", on_cache_clear_hook);
+        hook_dissociate("msr song invalidate", on_song_invalidate_hook);
+        g_hooks_registered = false;
+    }
 }
 
 /**
@@ -770,6 +797,7 @@ void msr_invalidate_song_detail(const String & cid)
     StringBuf meta_dir = filename_build({cache_dir, "meta"});
     StringBuf filepath = filename_build({meta_dir, StringBuf(str_concat({"song_", (const char *)cid, ".json"}))});
     QFile::remove((const char *)filepath);
+    hook_call("msr song invalidate", (void *)(const char *)cid);
 }
 
 MsrAlbum msr_fetch_album_detail(const String & cid)
@@ -993,4 +1021,5 @@ void msr_invalidate_catalog_cache()
     QFile::remove((const char *)filepath);
 
     msr_cache_clear();
+    hook_call("msr cache clear", nullptr);
 }
