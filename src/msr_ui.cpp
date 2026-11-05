@@ -89,6 +89,7 @@ public:
 
     bool init() override
     {
+        msr_reset_shutdown();
         aud_config_set_defaults("monster-siren", msr_ui_defaults);
         msr_get_cache_dir(); // populate default cache dir right at startup for UI display
         return true;

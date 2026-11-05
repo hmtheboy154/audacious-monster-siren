@@ -120,6 +120,7 @@ public:
 
     bool init() override
     {
+        msr_reset_shutdown();
         aud_config_set_defaults("monster-siren", msr_gtk_defaults);
         return true;
     }

@@ -181,6 +181,7 @@ public:
 
     bool init() override
     {
+        msr_reset_shutdown();
         aud_config_set_defaults("monster-siren", msr_input_defaults);
         return true;
     }

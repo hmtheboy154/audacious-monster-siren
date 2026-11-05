@@ -24,6 +24,7 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <memory>
 #include <cstring>
 #include <cstdlib>
 
@@ -46,14 +47,53 @@ static std::map<std::string, String> g_cached_lyrics;
 /* Every module (input + each UI plugin) gets its own copy of this registry
  * because the backend is a static library; each plugin only ever joins the
  * threads it spawned itself, which is exactly what its cleanup() needs. */
+struct WorkerEntry {
+    std::thread thread;
+    std::shared_ptr<std::atomic<bool>> done;
+};
+
 static std::mutex g_thread_mutex;
-static std::vector<std::thread> g_threads;
+static std::vector<WorkerEntry> g_threads;
 static std::atomic<bool> g_shutting_down{false};
+
+void msr_reset_shutdown()
+{
+    g_shutting_down = false;
+}
 
 void msr_run_background(std::function<void()> task)
 {
-    std::lock_guard<std::mutex> lock(g_thread_mutex);
-    g_threads.emplace_back(std::move(task));
+    std::vector<std::thread> finished;
+    auto done = std::make_shared<std::atomic<bool>>(false);
+
+    {
+        std::lock_guard<std::mutex> lock(g_thread_mutex);
+        auto it = g_threads.begin();
+        while (it != g_threads.end()) {
+            if (it->done->load(std::memory_order_acquire)) {
+                finished.push_back(std::move(it->thread));
+                it = g_threads.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        g_threads.push_back({
+            std::thread([task = std::move(task), done]() {
+                task();
+                done->store(true, std::memory_order_release);
+            }),
+            done
+        });
+    }
+
+    for (auto & thread : finished) {
+        if (thread.joinable()) {
+            if (thread.get_id() != std::this_thread::get_id())
+                thread.join();
+            else
+                thread.detach();
+        }
+    }
 }
 
 void msr_begin_shutdown()
@@ -65,15 +105,15 @@ void msr_wait_for_background_threads()
 {
     msr_begin_shutdown();
 
-    std::vector<std::thread> threads;
+    std::vector<WorkerEntry> entries;
     {
         std::lock_guard<std::mutex> lock(g_thread_mutex);
-        threads.swap(g_threads);
+        entries.swap(g_threads);
     }
 
-    for (auto & thread : threads)
-        if (thread.joinable())
-            thread.join();
+    for (auto & entry : entries)
+        if (entry.thread.joinable())
+            entry.thread.join();
 }
 
 /**

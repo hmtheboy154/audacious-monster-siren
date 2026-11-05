@@ -93,10 +93,11 @@ void msr_invalidate_catalog_cache();
 // which crashes (SIGSEGV) in the freed transport/OpenSSL code. These helpers
 // keep every worker trackable per module so each plugin can join its own
 // threads before teardown:
-//  - msr_run_background() spawns and registers a worker thread.
+//  - msr_reset_shutdown() clears the shutdown flag when a plugin starts/re-enables.
+//  - msr_run_background() reaps finished workers and spawns/registers a new thread.
 //  - msr_wait_for_background_threads() sets the shutdown flag (aborting
 //    in-flight fetches at the next bounded read) and joins all threads.
-// The flag is only ever armed at exit, never during normal playback.
+void msr_reset_shutdown();
 void msr_run_background(std::function<void()> task);
 void msr_wait_for_background_threads();
 
