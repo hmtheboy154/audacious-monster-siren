@@ -250,7 +250,7 @@ static bool probe_remote_length(const String & cid, const String & sourceUrl, Tu
     String cached_path;
     bool use_cache = cid && msr_find_cached_audio(cid, cached_path);
     if (use_cache) {
-        probe_url = String(StringBuf(str_concat({"file://", cached_path})));
+        probe_url = String(filename_to_uri(cached_path));
         AUDINFO("MSR: probe_remote_length using local audio cache for cid %s -> %s\n", (const char *)cid, (const char *)probe_url);
     } else {
         AUDINFO("MSR: probe_remote_length probing remote URL for cid %s -> %s\n", (const char *)cid, (const char *)probe_url);
@@ -540,7 +540,7 @@ public:
         bool using_cached_audio = msr_find_cached_audio(song.cid, cached_path);
         if (using_cached_audio) {
             AUDINFO("Playing Monster Siren track %s directly from offline disk cache: %s\n", (const char *)song.name, (const char *)cached_path);
-            stream_url = String(StringBuf(str_concat({"file://", cached_path})));
+            stream_url = String(filename_to_uri(cached_path));
         }
 
         AUDINFO("Streaming Monster Siren track %s from URL: %s\n", (const char *)song.name, (const char *)stream_url);

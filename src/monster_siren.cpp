@@ -209,13 +209,19 @@ MsrUrlParsed msr_parse_url(const char * url)
 
     // Check custom scheme msr://
     if (s.rfind("msr://album/", 0) == 0) {
-        result.cid = String(cid_at(s, 12).c_str());
+        std::string cid = cid_at(s, 12);
+        if (cid.empty())
+            return result;
+        result.cid = String(cid.c_str());
         result.subtune_index = subtune;
         result.type = (subtune > 0) ? MsrUrlType::AlbumTrack : MsrUrlType::Album;
         return result;
     }
     if (s.rfind("msr://song/", 0) == 0) {
-        result.cid = String(cid_at(s, 11).c_str());
+        std::string cid = cid_at(s, 11);
+        if (cid.empty())
+            return result;
+        result.cid = String(cid.c_str());
         result.type = MsrUrlType::Song;
         return result;
     }
@@ -263,14 +269,15 @@ MsrUrlParsed msr_parse_url(const char * url)
         }
 
         if (start != std::string::npos) {
+            std::string cid = cid_at(s, start + strlen(marker));
+            if (cid.empty())
+                return result;
+            result.cid = String(cid.c_str());
             result.subtune_index = subtune;
-            if (album) {
-                result.cid = String(cid_at(s, start + strlen(marker)).c_str());
+            if (album)
                 result.type = (subtune > 0) ? MsrUrlType::AlbumTrack : MsrUrlType::Album;
-            } else {
-                result.cid = String(cid_at(s, start + strlen(marker)).c_str());
+            else
                 result.type = MsrUrlType::Song;
-            }
             return result;
         }
     }
@@ -289,15 +296,11 @@ String msr_get_cache_dir()
         StringBuf def = str_copy(qpath.toUtf8().constData());
         aud_set_str("monster-siren", "cache_dir", def);
         dir = String(def);
-    } else {
-        QString qstr = QString::fromUtf8((const char *)dir);
-        if (qstr.startsWith("file://")) {
-            qstr = QUrl(qstr).toLocalFile();
-            if (qstr.isEmpty())
-                qstr = QString::fromUtf8((const char *)dir).mid(7);
-            StringBuf cleaned = str_copy(qstr.toUtf8().constData());
-            aud_set_str("monster-siren", "cache_dir", cleaned);
-            dir = String(cleaned);
+    } else if (!strncmp((const char *)dir, "file://", 7)) {
+        StringBuf local = uri_to_filename((const char *)dir);
+        if (local && local[0]) {
+            aud_set_str("monster-siren", "cache_dir", local);
+            dir = String(local);
         }
     }
     return dir;
