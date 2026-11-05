@@ -18,6 +18,7 @@
 #include <libaudcore/preferences.h>
 #include <vector>
 #include <thread>
+#include <cstdio>
 #include <cstring>
 
 static const char * const msr_schemes[] = {"msr", nullptr};
@@ -536,13 +537,10 @@ public:
 
         String stream_url = song.sourceUrl;
         String cached_path;
-        if (msr_find_cached_audio(song.cid, cached_path)) {
+        bool using_cached_audio = msr_find_cached_audio(song.cid, cached_path);
+        if (using_cached_audio) {
             AUDINFO("Playing Monster Siren track %s directly from offline disk cache: %s\n", (const char *)song.name, (const char *)cached_path);
             stream_url = String(StringBuf(str_concat({"file://", cached_path})));
-        } else if (aud_get_bool("monster-siren", "enable_cache") && aud_get_bool("monster-siren", "cache_audio") && song.sourceUrl) {
-            msr_run_background([cid = String(song.cid), sourceUrl = String(song.sourceUrl)]() {
-                msr_fetch_and_cache_audio_background(cid, sourceUrl);
-            });
         }
 
         AUDINFO("Streaming Monster Siren track %s from URL: %s\n", (const char *)song.name, (const char *)stream_url);
@@ -555,9 +553,24 @@ public:
                 decoder = aud_file_find_decoder(stream_url, false, source_file);
         }
 
+        // If a cached local audio file failed to open/decode, purge it and fall back to remote stream
+        if ((!source_file || !decoder) && using_cached_audio) {
+            AUDWARN("Cached audio file %s could not be decoded; removing and falling back to remote stream\n",
+                    (const char *)cached_path);
+            std::remove((const char *)cached_path);
+            using_cached_audio = false;
+            stream_url = song.sourceUrl;
+            source_file = VFSFile(stream_url, "r");
+            if (source_file) {
+                decoder = aud_file_find_decoder(stream_url, true, source_file);
+                if (!decoder)
+                    decoder = aud_file_find_decoder(stream_url, false, source_file);
+            }
+        }
+
         // If connection or decoder check failed on remote stream (e.g. HTTP 403 CDN token expired),
         // invalidate cached song detail and refetch from API for a brand new sourceUrl + token!
-        if ((!source_file || !decoder) && !msr_find_cached_audio(song.cid, cached_path)) {
+        if ((!source_file || !decoder) && !using_cached_audio) {
             AUDWARN("Stream open/decode failed for %s (likely 403 expired token). Refetching fresh song detail...\n", (const char *)stream_url);
             msr_invalidate_song_detail(song.cid);
             song = msr_fetch_song_detail(song.cid);
@@ -577,6 +590,14 @@ public:
         if (!decoder) {
             AUDERR("Could not find decoder plugin for %s\n", (const char *)stream_url);
             return false;
+        }
+
+        if (!using_cached_audio && aud_get_bool("monster-siren", "enable_cache") &&
+            aud_get_bool("monster-siren", "cache_audio") && song.sourceUrl && song.sourceUrl[0])
+        {
+            msr_run_background([cid = String(song.cid), sourceUrl = String(song.sourceUrl)]() {
+                msr_fetch_and_cache_audio_background(cid, sourceUrl);
+            });
         }
 
         auto ip = (InputPlugin *)aud_plugin_get_header(decoder);

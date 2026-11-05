@@ -17,10 +17,13 @@
 #include <QUrl>
 #include <QThread>
 #include <QFile>
+#include <QFileInfo>
+#include <QSaveFile>
 #include <QDir>
 #include <QCryptographicHash>
 #include <mutex>
 #include <map>
+#include <set>
 #include <vector>
 #include <thread>
 #include <atomic>
@@ -133,7 +136,10 @@ static QByteArray msr_fetch_bytes(const QString & url)
 
         VFSFile file(aud_url, "r");
         if (file) {
+            int64_t expected = file.fsize();
             QByteArray out;
+            if (expected > 0 && expected <= 256 * 1024 * 1024)
+                out.reserve((int)expected);
             char buf[65536];
             while (!g_shutting_down) {
                 int64_t n = file.fread(buf, 1, sizeof(buf));
@@ -143,7 +149,8 @@ static QByteArray msr_fetch_bytes(const QString & url)
             }
             if (g_shutting_down)
                 return QByteArray();
-            if (out.size() > 0)
+            bool complete = (expected > 0) ? (out.size() >= expected) : file.feof();
+            if (complete && out.size() > 0)
                 return out;
         }
 
@@ -335,6 +342,38 @@ bool msr_load_catalog_from_cache(std::vector<MsrAlbum> & out_albums)
     return true;
 }
 
+static bool msr_atomic_write(const char * filepath, const char * data, int64_t len)
+{
+    if (!filepath || !data || len <= 0)
+        return false;
+
+    QSaveFile file(QString::fromUtf8(filepath));
+    if (!file.open(QIODevice::WriteOnly))
+        return false;
+    if (file.write(data, len) != len) {
+        file.cancelWriting();
+        return false;
+    }
+    return file.commit();
+}
+
+static bool msr_nonempty_file_exists(const char * filepath)
+{
+    QFileInfo info(QString::fromUtf8(filepath));
+    return info.exists() && info.isFile() && info.size() > 0;
+}
+
+static String msr_audio_ext_for_url(const String & sourceUrl)
+{
+    // Strip query parameters before finding extension (CDN URLs contain ?token=...)
+    std::string url_clean((const char *)sourceUrl);
+    size_t qmark = url_clean.find('?');
+    if (qmark != std::string::npos)
+        url_clean = url_clean.substr(0, qmark);
+    const char * dot = strrchr(url_clean.c_str(), '.');
+    return (dot && strlen(dot) <= 5) ? String(dot) : String(".mp3");
+}
+
 void msr_save_catalog_to_cache(const std::vector<MsrAlbum> & albums)
 {
     if (!aud_get_bool("monster-siren", "enable_cache") || !aud_get_bool("monster-siren", "cache_catalog") || albums.empty())
@@ -355,10 +394,8 @@ void msr_save_catalog_to_cache(const std::vector<MsrAlbum> & albums)
     }
     QJsonObject root;
     root["data"] = arr;
-    QJsonDocument doc(root);
-    QFile file((const char *)filepath);
-    if (file.open(QIODevice::WriteOnly))
-        file.write(doc.toJson(QJsonDocument::Compact));
+    QByteArray json = QJsonDocument(root).toJson(QJsonDocument::Compact);
+    msr_atomic_write((const char *)filepath, json.constData(), json.size());
 }
 
 bool msr_find_cached_art(const String & cid_or_url, String & out_path)
@@ -370,7 +407,7 @@ bool msr_find_cached_art(const String & cid_or_url, String & out_path)
     StringBuf art_dir = filename_build({cache_dir, "art"});
     QString hash = msr_url_to_hash((const char *)cid_or_url);
     StringBuf filepath = filename_build({art_dir, StringBuf(str_concat({"cover_", hash.toUtf8().constData(), ".jpg"}))});
-    if (QFile::exists((const char *)filepath)) {
+    if (msr_nonempty_file_exists((const char *)filepath)) {
         out_path = String(filepath);
         return true;
     }
@@ -388,9 +425,7 @@ void msr_save_art_to_cache(const String & cid_or_url, const Index<char> & data)
 
     QString hash = msr_url_to_hash((const char *)cid_or_url);
     StringBuf filepath = filename_build({art_dir, StringBuf(str_concat({"cover_", hash.toUtf8().constData(), ".jpg"}))});
-    QFile file((const char *)filepath);
-    if (file.open(QIODevice::WriteOnly))
-        file.write(data.begin(), data.len());
+    msr_atomic_write((const char *)filepath, data.begin(), data.len());
 }
 
 bool msr_find_cached_audio(const String & cid, String & out_path)
@@ -404,7 +439,7 @@ bool msr_find_cached_audio(const String & cid, String & out_path)
     const char * exts[] = {".mp3", ".flac", ".wav", ".aac", ".m4a", ".ogg", ".wma"};
     for (const char * ext : exts) {
         StringBuf filepath = filename_build({audio_dir, StringBuf(str_concat({"audio_", cid, ext}))});
-        if (QFile::exists((const char *)filepath)) {
+        if (msr_nonempty_file_exists((const char *)filepath)) {
             out_path = String(filepath);
             return true;
         }
@@ -421,17 +456,9 @@ void msr_save_audio_to_cache(const String & cid, const String & sourceUrl, const
     StringBuf audio_dir = filename_build({cache_dir, "audio"});
     QDir().mkpath(QString::fromUtf8((const char *)audio_dir));
 
-    // Strip query parameters before finding extension (CDN URLs contain ?token=...)
-    std::string url_clean((const char *)sourceUrl);
-    size_t qmark = url_clean.find('?');
-    if (qmark != std::string::npos)
-        url_clean = url_clean.substr(0, qmark);
-    const char * dot = strrchr(url_clean.c_str(), '.');
-    String ext = (dot && strlen(dot) <= 5) ? String(dot) : String(".mp3");
+    String ext = msr_audio_ext_for_url(sourceUrl);
     StringBuf filepath = filename_build({audio_dir, StringBuf(str_concat({"audio_", cid, ext}))});
-    QFile file((const char *)filepath);
-    if (file.open(QIODevice::WriteOnly))
-        file.write(data.begin(), data.len());
+    msr_atomic_write((const char *)filepath, data.begin(), data.len());
 }
 
 bool msr_find_cached_lyrics(const String & cid_or_url, String & out_path)
@@ -443,7 +470,7 @@ bool msr_find_cached_lyrics(const String & cid_or_url, String & out_path)
     StringBuf lyrics_dir = filename_build({cache_dir, "lyrics"});
     QString hash = msr_url_to_hash((const char *)cid_or_url);
     StringBuf filepath = filename_build({lyrics_dir, StringBuf(str_concat({"lyric_", hash.toUtf8().constData(), ".lrc"}))});
-    if (QFile::exists((const char *)filepath)) {
+    if (msr_nonempty_file_exists((const char *)filepath)) {
         out_path = String(filepath);
         return true;
     }
@@ -461,23 +488,78 @@ void msr_save_lyrics_to_cache(const String & cid_or_url, const String & lyrics_t
 
     QString hash = msr_url_to_hash((const char *)cid_or_url);
     StringBuf filepath = filename_build({lyrics_dir, StringBuf(str_concat({"lyric_", hash.toUtf8().constData(), ".lrc"}))});
-    QFile file((const char *)filepath);
-    if (file.open(QIODevice::WriteOnly))
-        file.write((const char *)lyrics_text, strlen((const char *)lyrics_text));
+    msr_atomic_write((const char *)filepath, (const char *)lyrics_text, strlen((const char *)lyrics_text));
 }
+
+static std::mutex g_inflight_audio_mutex;
+static std::set<std::string> g_inflight_audio_cids;
 
 void msr_fetch_and_cache_audio_background(const String & cid, const String & sourceUrl)
 {
     if (!cid || !sourceUrl || !aud_get_bool("monster-siren", "enable_cache") || !aud_get_bool("monster-siren", "cache_audio"))
         return;
-    String path;
-    if (msr_find_cached_audio(cid, path))
+
+    String existing_path;
+    if (msr_find_cached_audio(cid, existing_path))
         return;
-    QByteArray bytes = msr_fetch_bytes(QString::fromUtf8((const char *)sourceUrl));
-    if (!bytes.isEmpty()) {
-        Index<char> data;
-        data.insert(bytes.constData(), 0, bytes.size());
-        msr_save_audio_to_cache(cid, sourceUrl, data);
+
+    std::string cid_key((const char *)cid);
+    {
+        std::lock_guard<std::mutex> lock(g_inflight_audio_mutex);
+        if (!g_inflight_audio_cids.insert(cid_key).second)
+            return;
+    }
+
+    struct InflightGuard {
+        std::string key;
+        ~InflightGuard()
+        {
+            std::lock_guard<std::mutex> lock(g_inflight_audio_mutex);
+            g_inflight_audio_cids.erase(key);
+        }
+    } guard{cid_key};
+
+    if (msr_find_cached_audio(cid, existing_path))
+        return;
+
+    String cache_dir = msr_get_cache_dir();
+    StringBuf audio_dir = filename_build({cache_dir, "audio"});
+    QDir().mkpath(QString::fromUtf8((const char *)audio_dir));
+
+    String ext = msr_audio_ext_for_url(sourceUrl);
+    StringBuf filepath = filename_build({audio_dir, StringBuf(str_concat({"audio_", cid, ext}))});
+
+    for (int attempt = 0; attempt < 3 && !g_shutting_down; attempt++) {
+        VFSFile remote(sourceUrl, "r");
+        if (remote) {
+            int64_t expected = remote.fsize();
+            QSaveFile out(QString::fromUtf8((const char *)filepath));
+            if (!out.open(QIODevice::WriteOnly))
+                return;
+
+            char buf[65536];
+            int64_t written = 0;
+            bool write_ok = true;
+            while (!g_shutting_down) {
+                int64_t n = remote.fread(buf, 1, sizeof(buf));
+                if (n <= 0)
+                    break;
+                if (out.write(buf, n) != n) {
+                    write_ok = false;
+                    break;
+                }
+                written += n;
+            }
+
+            bool complete = !g_shutting_down && write_ok && written > 0 &&
+                            ((expected > 0) ? (written >= expected) : remote.feof());
+            if (complete && out.commit())
+                return;
+            out.cancelWriting();
+        }
+
+        if (attempt < 2 && !g_shutting_down)
+            QThread::msleep(150 * (attempt + 1));
     }
 }
 
@@ -605,9 +687,8 @@ void msr_save_album_detail_to_cache(const MsrAlbum & album)
     }
     obj["tracks"] = tracks_arr;
 
-    QFile file((const char *)filepath);
-    if (file.open(QIODevice::WriteOnly))
-        file.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    QByteArray json = QJsonDocument(obj).toJson(QJsonDocument::Compact);
+    msr_atomic_write((const char *)filepath, json.constData(), json.size());
 }
 
 bool msr_find_cached_song_detail(const String & cid, MsrSongDetail & out_song)
@@ -670,9 +751,8 @@ void msr_save_song_detail_to_cache(const MsrSongDetail & song)
     obj["artists"] = (const char *)song.artists;
     obj["duration_ms"] = song.duration_ms;
 
-    QFile file((const char *)filepath);
-    if (file.open(QIODevice::WriteOnly))
-        file.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    QByteArray json = QJsonDocument(obj).toJson(QJsonDocument::Compact);
+    msr_atomic_write((const char *)filepath, json.constData(), json.size());
 }
 
 void msr_invalidate_song_detail(const String & cid)
