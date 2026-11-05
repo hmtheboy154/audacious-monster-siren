@@ -4,9 +4,9 @@ A flagship, feature-rich Audacious plugin suite that fetches, catalogs, caches, 
 
 ## Requirements
 
-- **Audacious 4.6.1 or above** (`libaudcore`, `libaudqt` headers and libraries)
-- **Qt 6** (`Core`, `Network`, `Widgets`) or Qt 5
-- **GTK 3** (`libgtk-3` dev headers) for the GTK3 catalog UI
+- **Audacious 4.6.1 or above** (`libaudcore` headers and libraries)
+- **Qt 6** (`Core` for JSON/cache utilities; optional `Widgets` for the Qt catalog UI)
+- **GTK 3** (optional `libgtk-3` dev headers for the GTK3 catalog UI)
 - **CMake 3.16+** and a C++20 compatible compiler
 
 ---
@@ -18,11 +18,11 @@ This project builds three synergistic Audacious plugin modules powered by a high
 ### 1. Monster Siren Input Plugin (`monster-siren-input.so`)
 - **URL & Scheme Recognition**: Automatically recognizes URLs from `https://monster-siren.hypergryph.com` or custom `msr://` URIs (`msr://album/<cid>` and `msr://song/<cid>`) when opened via Audacious' **Open URL** (`Ctrl+L`) or **Add URL** dialogs.
 - **Album Track Expansion**: When an Album URL is added, the plugin queries `/api/album/<cid>/detail`, dynamically sets Audacious's subtune count to the exact number of tracks ($N$), and expands into separate playlist entries (`msr://album/<cid>?1` through `?N`).
-- **Resilient VFS Playback & Full Timestamp Seeking**: Probes track headers via `probe_remote_length()` to populate precise durations (`Tuple::Length`), enabling full song timestamps (`0:00 / 3:42`) and accurate seekbar dragging (`fseek` / HTTP `Range: bytes=`) across both individual songs and album tracks. Always opens a pristine `VFSFile` handle from byte 0 before handing off to native decoders (`sndfile`, `mpg123`, `ffaudio`) to prevent seek state corruption.
-- **Automatic HTTP 403 CDN Token Recovery**: Monster Siren CDN (`hycdn.cn`) stream URLs contain access tokens (`?token=...`) that expire after several hours (`HTTP 403 Forbidden`). During stream initialization (`play()`), the plugin automatically detects connection or decoder failures on expired tokens, invalidates stale caches, and refetches fresh API URLs on the fly without interrupting playback or requiring manual user intervention.
-- **Embedded Lyrics & Dual-Mode Tag Scanning**: Populates synchronized `.lrc` lyrics (`Tuple::Lyrics`) right into Audacious's built-in **Lyrics** (`lyrics-qt` / `lyrics-gtk`) dockable window. Uses intelligent dual-mode `read_tag()` detection:
-  - **Fast Scan Mode (`image == null`)**: When Audacious scans tracks to populate playlist table rows, duration and lyrics are read instantly from local cache (`0 ms`) without making blocking network requests.
-  - **Playback Preparation Mode (`image != null`)**: Right before `setup_playback()` runs (`or on right-click -> View Song Info`), exact lyrics and duration are verified and populated, ensuring the dockable `Lyrics` window shows synchronized lines immediately without triggering slow online provider timeouts or UI freezes.
+- **Resilient VFS Playback & Full Timestamp Seeking**: Probes WAV, FLAC, and MP3 stream headers via `probe_remote_length()` to populate precise durations (`Tuple::Length`), enabling full song timestamps (`0:00 / 3:42`) and accurate seekbar dragging (`fseek` / HTTP `Range: bytes=`) across both individual songs and album tracks. Always opens a pristine `VFSFile` handle from byte 0 before handing off to native decoders (`sndfile`, `mpg123`, `ffaudio`) to prevent seek state corruption.
+- **Automatic HTTP 403 CDN Token Recovery**: Monster Siren CDN (`hycdn.cn`) stream URLs contain access tokens (`?token=...`) that expire after several hours (`HTTP 403 Forbidden`). During duration probing and stream initialization (`play()`), the plugin automatically detects connection or decoder failures on expired tokens, invalidates stale caches across modules, and refetches fresh API URLs on the fly without interrupting playback or requiring manual user intervention.
+- **Embedded Lyrics & Dual-Mode Tag Scanning**: Populates synchronized `.lrc` lyrics (`Tuple::Lyrics`) right into Audacious's built-in **Lyrics** (`lyrics-qt` / `lyrics-gtk`) dockable window. Uses dual-mode `read_tag()` handling:
+  - **Playlist Scan Mode (`image == null`)**: Populates track metadata, bounded header durations (cached in memory/disk after the first probe), and lyrics without downloading cover art images for every row.
+  - **Playback Preparation Mode (`image != null`)**: Right before `setup_playback()` runs (or on right-click -> View Song Info), fetches high-resolution album/MV cover art alongside verified duration and lyrics.
 
 ### 2. Monster Siren Catalog UI & Settings
 
@@ -36,8 +36,8 @@ A native dockable catalog window is provided for both Audacious interfaces, shar
 - **Instant Search & One-Click Playback**: Real-time filtering (`QSortFilterProxyModel`) across Album Titles and Artistes. Double-clicking any album clears the active queue and starts playback instantly (`aud_drct_pl_open_list`).
 - **Persistent Disk Caching & Indexing**: Comprehensive offline storage engine for catalog data, cover art, audio tracks, and lyrics, customizable under **Audacious Preferences $\rightarrow$ Plugins $\rightarrow$ Input $\rightarrow$ Monster Siren Input Plugin** (the input plugin owns these settings because it performs the caching during playback):
   - **Directory Selection**: Configurable cache directory with a native Browse dialog (`~/.cache/audacious/monster-siren` by default) supporting automatic `file://` URI prefix sanitization.
-  - **Granular Checkboxes**: Individual toggles for `Cache Catalog Data`, `Cache Album & Song Metadata`, `Cache Cover Art Images`, `Cache Audio Files (.mp3/.flac/.wav)`, and `Cache Lyrics (.lrc)`.
-  - **Background Audio Caching**: When `Cache Audio Files` is enabled, tracks being played over the network automatically buffer and save to local disk on a background thread (`msr_fetch_and_cache_audio_background`), allowing transparent `file://` offline playback on subsequent listens.
+  - **Granular Checkboxes**: Individual toggles for `Cache Catalog Metadata Index`, `Cache Album Cover Art Images`, and `Cache Audio Tracks & Lyrics during playback`.
+  - **Background Audio Caching**: When `Cache Audio Tracks & Lyrics during playback` is enabled, tracks being played over the network stream directly into atomic on-disk cache files on a background thread (`msr_fetch_and_cache_audio_background`), allowing transparent `file://` offline playback on subsequent listens.
   - **Manual Sync Mode**: Run 100% offline from local disk caches without network queries until explicitly forcing a catalog refresh via the top header bar (`Refresh` button).
 
 **GTK 3 (`monster-siren-gtk.so`, `PluginGLibOnly`)**:

@@ -144,7 +144,7 @@ install(TARGETS monster-siren-input
 
 # 2. General/UI Plugin Module (Dockable Catalog Window & Settings for -i qt)
 if(MSR_BUILD_QT_UI_ENABLED)
-    message(STATUS "Qt6Widgets found, enabling monster-siren-ui target")
+    message(STATUS "Monster Siren: enabling monster-siren-ui target")
     add_library(monster-siren-ui MODULE src/msr_ui.cpp)
     target_include_directories(monster-siren-ui PRIVATE ${AUDACIOUS_INCLUDE_DIRS})
     target_link_libraries(monster-siren-ui PRIVATE
@@ -161,12 +161,12 @@ if(MSR_BUILD_QT_UI_ENABLED)
         LIBRARY DESTINATION "${AUDACIOUS_PLUGIN_DIR}/General"
     )
 else()
-    message(STATUS "Qt6Widgets not found, skipping monster-siren-ui target")
+    message(STATUS "Monster Siren: skipping monster-siren-ui target")
 endif()
 
 # 3. GTK General/UI Plugin Module (Dockable Catalog Window for -i gtk)
 if(MSR_BUILD_GTK_UI_ENABLED)
-    message(STATUS "GTK3 found (${GTK3_VERSION}), enabling monster-siren-gtk target")
+    message(STATUS "Monster Siren: enabling monster-siren-gtk target (GTK ${GTK3_VERSION})")
     add_library(monster-siren-gtk MODULE src/msr_ui_gtk.cpp)
     target_include_directories(monster-siren-gtk PRIVATE ${AUDACIOUS_INCLUDE_DIRS} ${GTK3_INCLUDE_DIRS})
     target_link_libraries(monster-siren-gtk PRIVATE
@@ -182,7 +182,7 @@ if(MSR_BUILD_GTK_UI_ENABLED)
         LIBRARY DESTINATION "${AUDACIOUS_PLUGIN_DIR}/General"
     )
 else()
-    message(STATUS "GTK3 not found, skipping monster-siren-gtk target")
+    message(STATUS "Monster Siren: skipping monster-siren-gtk target")
 endif()
 
 message(STATUS "Audacious version: ${AUDACIOUS_VERSION}")
