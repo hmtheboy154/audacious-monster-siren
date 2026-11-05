@@ -19,6 +19,7 @@
 #include <QStackedWidget>
 #include <QStyledItemDelegate>
 #include <QPainter>
+#include <QFontMetrics>
 #include <QIcon>
 #include <QImage>
 #include <QStandardItemModel>
@@ -29,6 +30,8 @@
 #include <QPointer>
 #include <atomic>
 #include <cstdint>
+#include <algorithm>
+#include <vector>
 #include <thread>
 
 #include "monster_siren.h"
@@ -51,6 +54,7 @@ static const char * const msr_ui_defaults[] = {
 };
 
 static void on_window_enable_changed();
+static void on_view_prefs_changed();
 
 static const ComboItem view_mode_elems[] = {
     ComboItem(N_("Simple List"), 0),
@@ -63,10 +67,10 @@ static const PreferencesWidget msr_ui_widgets[] = {
                 WidgetBool("monster-siren", "enable_dedicated_window", on_window_enable_changed)),
     WidgetLabel(N_("<b>Catalog View &amp; Layout</b>"), WIDGET_CHILD),
     WidgetCombo(N_("Default Catalog View Mode"),
-                WidgetInt("monster-siren", "default_view_mode"),
+                WidgetInt("monster-siren", "default_view_mode", on_view_prefs_changed),
                 WidgetVCombo{{view_mode_elems}, nullptr}, WIDGET_CHILD),
     WidgetCheck(N_("Show album art icons in Simple List mode (uses more RAM)"),
-                WidgetBool("monster-siren", "simple_mode_art"), WIDGET_CHILD)
+                WidgetBool("monster-siren", "simple_mode_art", on_view_prefs_changed), WIDGET_CHILD)
 };
 
 static const PluginPreferences msr_ui_prefs = {.widgets = msr_ui_widgets, .init = nullptr, .apply = nullptr, .cleanup = nullptr};
@@ -169,6 +173,15 @@ public:
     }
 };
 
+static QFont make_smaller_font(QFont font)
+{
+    if (font.pointSize() > 1)
+        font.setPointSize(font.pointSize() - 1);
+    else if (font.pixelSize() > 2)
+        font.setPixelSize(font.pixelSize() - 1);
+    return font;
+}
+
 class AlbumListDelegate : public QStyledItemDelegate
 {
 public:
@@ -205,26 +218,36 @@ public:
         QString title = index.data(Qt::DisplayRole).toString();
         QString artist = index.data(Qt::UserRole + 1).toString(); // custom role for artist
 
-        QRect text_rect = rect.adjusted(icon_size + 12, 4, -4, -4);
+        QRect text_rect = rect.adjusted(icon_size + 12, 4, -6, -4);
         QFont title_font = option.font;
         title_font.setBold(true);
-        painter->setFont(title_font);
-        painter->drawText(text_rect.left(), text_rect.top() + 16, title);
+        QFont artist_font = make_smaller_font(option.font);
 
-        QFont artist_font = option.font;
-        artist_font.setPointSize(artist_font.pointSize() - 1);
+        QFontMetrics title_fm(title_font);
+        QFontMetrics artist_fm(artist_font);
+        int block_h = title_fm.height() + 2 + artist_fm.height();
+        int top_y = text_rect.top() + std::max(0, (text_rect.height() - block_h) / 2);
+
+        painter->setFont(title_font);
+        QRect title_rect(text_rect.left(), top_y, text_rect.width(), title_fm.height());
+        painter->drawText(title_rect, Qt::AlignLeft | Qt::AlignVCenter,
+                          title_fm.elidedText(title, Qt::ElideRight, text_rect.width()));
+
         painter->setFont(artist_font);
         if (!(option.state & QStyle::State_Selected))
             painter->setPen(option.palette.color(QPalette::Disabled, QPalette::Text));
-        painter->drawText(text_rect.left(), text_rect.top() + 34, artist);
+        QRect artist_rect(text_rect.left(), top_y + title_fm.height() + 2,
+                          text_rect.width(), artist_fm.height());
+        painter->drawText(artist_rect, Qt::AlignLeft | Qt::AlignVCenter,
+                          artist_fm.elidedText(artist, Qt::ElideRight, text_rect.width()));
 
         painter->restore();
     }
 
     QSize sizeHint(const QStyleOptionViewItem & option, const QModelIndex & index) const override
     {
-        (void)option; (void)index;
-        return QSize(200, 56);
+        (void)index;
+        return QSize(200, std::max(56, option.fontMetrics.height() * 2 + 16));
     }
 };
 
@@ -259,9 +282,7 @@ public:
 
         QString title = index.data(Qt::DisplayRole).toString();
         QRect text_rect(rect.left(), art_rect.bottom() + 4, rect.width(), 32);
-        QFont font = option.font;
-        font.setPointSize(font.pointSize() - 1);
-        painter->setFont(font);
+        painter->setFont(make_smaller_font(option.font));
         painter->drawText(text_rect, Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap, title);
 
         painter->restore();
@@ -363,6 +384,7 @@ public:
         connect(m_view_switch_btn, &QPushButton::clicked, this, [this]() {
             int current = m_stack->currentIndex();
             int next = (current + 1) % 3;
+            aud_set_int("monster-siren", "default_view_mode", next);
             set_view_mode(next);
         });
 
@@ -376,6 +398,11 @@ public:
         connect(m_grid_view, &QListView::doubleClicked, this, &MonsterSirenCatalogWidget::on_item_activated);
 
         refresh_catalog();
+    }
+
+    void apply_preferences()
+    {
+        set_view_mode(aud_get_int("monster-siren", "default_view_mode"));
     }
 
 private:
@@ -404,7 +431,9 @@ private:
         if ((mode != 0 || aud_get_bool("monster-siren", "simple_mode_art")) &&
             gen != 0 && m_images_loaded_gen != gen && m_model->rowCount() > 0) {
             start_async_image_loader();
-        } else if (mode == 0 && m_tree) {
+        }
+        if (mode == 0 && m_tree) {
+            m_tree->doItemsLayout();
             m_tree->viewport()->update();
         }
     }
@@ -531,12 +560,29 @@ private:
     }
 };
 
+static std::vector<QPointer<MonsterSirenCatalogWidget>> g_qt_widgets;
+
+static void on_view_prefs_changed()
+{
+    g_qt_widgets.erase(
+        std::remove_if(g_qt_widgets.begin(), g_qt_widgets.end(),
+                       [](const QPointer<MonsterSirenCatalogWidget> & w) { return w.isNull(); }),
+        g_qt_widgets.end());
+
+    for (auto & widget : g_qt_widgets) {
+        if (widget)
+            widget->apply_preferences();
+    }
+}
+
 void * MsrUiPlugin::get_qt_widget()
 {
     if (!aud_get_bool("monster-siren", "enable_dedicated_window"))
         return nullptr;
 
-    return new MonsterSirenCatalogWidget();
+    auto * widget = new MonsterSirenCatalogWidget();
+    g_qt_widgets.emplace_back(widget);
+    return widget;
 }
 
 #include "msr_ui.moc"
